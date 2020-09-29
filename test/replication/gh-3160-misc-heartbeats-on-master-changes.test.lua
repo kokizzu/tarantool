@@ -16,6 +16,7 @@ function wait_not_follow(replicaA, replicaB)
     end, box.cfg.replication_timeout)
 end;
 function test_timeout()
+    local log = require('log')
     local replicaA = box.info.replication[1].upstream or box.info.replication[2].upstream
     local replicaB = box.info.replication[3].upstream or box.info.replication[2].upstream
     local follows = test_run:wait_cond(function()
@@ -25,7 +26,9 @@ function test_timeout()
     for i = 0, 99 do
         box.space.test_timeout:replace({1})
         if wait_not_follow(replicaA, replicaB) then
-            return error(box.info.replication)
+            log.info("test_timeout() failed, box.info.replication:")
+            log.info(box.info.replication)
+            return false
         end
     end
     return true
