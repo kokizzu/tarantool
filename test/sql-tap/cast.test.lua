@@ -70,7 +70,7 @@ test:do_catchsql_test(
         SELECT CAST(x'616263' AS NUMBER)
     ]], {
         -- <cast-1.5>
-        1, 'Type mismatch: can not convert varbinary to number'
+        1, "Type mismatch: can not convert varbinary(x'616263') to number"
         -- </cast-1.5>
     })
 
@@ -100,7 +100,7 @@ test:do_catchsql_test(
         SELECT CAST(x'616263' AS integer)
     ]], {
         -- <cast-1.9>
-        1, 'Type mismatch: can not convert varbinary to integer'
+        1, "Type mismatch: can not convert varbinary(x'616263') to integer"
         -- </cast-1.9>
     })
 
@@ -450,7 +450,7 @@ test:do_catchsql_test(
         SELECT CAST('123abc' AS NUMBER)
     ]], {
         -- <cast-1.45>
-        1, 'Type mismatch: can not convert 123abc to number'
+        1, "Type mismatch: can not convert string('123abc') to number"
         -- </cast-1.45>
     })
 
@@ -470,7 +470,7 @@ test:do_catchsql_test(
         SELECT CAST('123abc' AS integer)
     ]], {
         -- <cast-1.49>
-        1, 'Type mismatch: can not convert 123abc to integer'
+        1, "Type mismatch: can not convert string('123abc') to integer"
         -- </cast-1.49>
     })
 
@@ -480,7 +480,7 @@ test:do_catchsql_test(
         SELECT CAST('123.5abc' AS NUMBER)
     ]], {
         -- <cast-1.51>
-        1, 'Type mismatch: can not convert 123.5abc to number'
+        1, "Type mismatch: can not convert string('123.5abc') to number"
         -- </cast-1.51>
     })
 
@@ -490,7 +490,7 @@ test:do_catchsql_test(
         SELECT CAST('123.5abc' AS integer)
     ]], {
         -- <cast-1.53>
-        1, 'Type mismatch: can not convert 123.5abc to integer'
+        1, "Type mismatch: can not convert string('123.5abc') to integer"
         -- </cast-1.53>
     })
 
@@ -561,7 +561,7 @@ test:do_catchsql_test(
         SELECT CAST('abc' AS NUMBER)
     ]], {
         -- <case-1.66>
-        1, 'Type mismatch: can not convert abc to number'
+        1, "Type mismatch: can not convert string('abc') to number"
         -- </case-1.66>
     })
 
@@ -786,13 +786,18 @@ test:do_execsql_test(
 -- Test to see if it is possible to trick sql into reading past
 -- the end of a blob when converting it to a number.
 if 0 > 0 then
+-- Legacy from the original code. Must be replaced with analogue
+-- functions from box.
+local sql_prepare = nil
+local sql_bind_blob = nil
+local sql_step = nil
+local sql_column_int = nil
+local STMT
 test:do_test(
     "cast-3.32.1",
     function()
-        local blob, DB, STMT
-        blob = 1234567890
-        DB = sql_connection_pointer("db")
-        STMT = sql_prepare(DB, "SELECT CAST(? AS NUMBER)", -1, "TAIL")
+        local blob = 1234567890
+        STMT = sql_prepare("SELECT CAST(? AS NUMBER)", -1, "TAIL")
         sql_bind_blob("-static", STMT, 1, blob, 5)
         return sql_step(STMT)
     end, {
@@ -830,7 +835,7 @@ test:do_test(
         ]]
     end, {
         -- <cast-4.1>
-        1, 'Type mismatch: can not convert abc to integer'
+        1, "Type mismatch: can not convert string('abc') to integer"
         -- </cast-4.1>
     })
 
@@ -842,7 +847,7 @@ test:do_test(
         ]]
     end, {
         -- <cast-4.2>
-        1, 'Type mismatch: can not convert abc to integer'
+        1, "Type mismatch: can not convert string('abc') to integer"
         -- </cast-4.2>
     })
 
@@ -854,7 +859,7 @@ test:do_test(
         ]]
     end, {
         -- <cast-4.4>
-        1, 'Type mismatch: can not convert abc to number'
+        1, "Type mismatch: can not convert string('abc') to number"
         -- </cast-4.4>
     })
 

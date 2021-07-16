@@ -1,6 +1,6 @@
 #!/usr/bin/env tarantool
 local test = require("sqltester")
-test:plan(78)
+test:plan(83)
 
 --!./tcltestrunner.lua
 -- 2002 February 26
@@ -32,7 +32,7 @@ test:plan(78)
 --     SELECT * FROM t1;
 --   }
 -- } {1 2 3 4 5 6 7 8 9}
--- 
+--
 test:do_execsql_test(
     "view-1.0",
     [[
@@ -88,8 +88,6 @@ test:do_execsql_test(
 test:do_test(
     "view-1.3.1",
     function()
-        --db("close")
-        --sql("db", "test.db")
         return test:execsql [[
             SELECT * FROM v1 ORDER BY a;
         ]]
@@ -234,7 +232,7 @@ test:do_execsql_test(
         -- </view-2.6>
     })
 
--- 
+--
 -- Test that column name of views are generated correctly.
 --
 test:do_execsql2_test(
@@ -502,24 +500,18 @@ test:do_execsql_test(
         -- </view-7.1>
     })
 
--- MUST_WORK_TEST db close problem
-if (0 > 0)
- then
-    test:do_test(
-        "view-7.2",
-        function()
-            db("close")
-            sql("db", "test.db")
-            return test:execsql [[
-                SELECT * FROM test;
-            ]]
-        end, {
-            -- <view-7.2>
-            1, 2, 3
-            -- </view-7.2>
-        })
+test:do_test(
+    "view-7.2",
+    function()
+        return test:execsql [[
+            SELECT * FROM test;
+        ]]
+    end, {
+        -- <view-7.2>
+        1, 2, 3
+        -- </view-7.2>
+    })
 
-end
 test:do_execsql_test(
     "view-7.3",
     [[
@@ -534,24 +526,18 @@ test:do_execsql_test(
         -- </view-7.3>
     })
 
--- MUST_WORK_TEST
-if (0 > 0)
- then
-    test:do_test(
-        "view-7.4",
-        function()
-            db("close")
-            sql("db", "test.db")
-            return test:execsql [[
-                SELECT * FROM test;
-            ]]
-        end, {
-            -- <view-7.4>
-            1, 2, 3
-            -- </view-7.4>
-        })
+test:do_test(
+    "view-7.4",
+    function()
+        return test:execsql [[
+            SELECT * FROM test;
+        ]]
+    end, {
+        -- <view-7.4>
+        1, 2, 3
+        -- </view-7.4>
+    })
 
-end
 test:do_execsql_test(
     "view-7.5",
     [[
@@ -566,24 +552,18 @@ test:do_execsql_test(
         -- </view-7.5>
     })
 
--- MUST_WORK_TEST
-if (0 > 0)
- then
-    test:do_test(
-        "view-7.6",
-        function()
-            db("close")
-            sql("db", "test.db")
-            return test:execsql [[
-                SELECT * FROM test;
-            ]]
-        end, {
-            -- <view-7.6>
-            1, 2, 3
-            -- </view-7.6>
-        })
+test:do_test(
+    "view-7.6",
+    function()
+        return test:execsql [[
+            SELECT * FROM test;
+        ]]
+    end, {
+        -- <view-7.6>
+        1, 2, 3
+        -- </view-7.6>
+    })
 
-end
 test:do_execsql_test(
     "view-8.1",
     [[
@@ -595,36 +575,28 @@ test:do_execsql_test(
         -- </view-8.1>
     })
 
--- MUST_WORK_TEST db close
-if (0 > 0)
- then
-    test:do_test(
-        "view-8.2",
-        function()
-            db("close")
-            sql("db", "test.db")
-            return test:execsql [[
-                SELECT * FROM v6 ORDER BY xyz;
-            ]]
-        end, {
-            -- <view-8.2>
-            7, 2, 13, 5, 19, 8, 27, 12
-            -- </view-8.2>
-        })
+test:do_test(
+    "view-8.2",
+    function()
+        return test:execsql [[
+            SELECT * FROM v6 ORDER BY xyz;
+        ]]
+    end, {
+        -- <view-8.2>
+        7, 2, 13, 5, 19, 8, 27, 12
+        -- </view-8.2>
+    })
 
-    -- MUST_WORK_TEST problem with column names
-    test:do_execsql_test(
-        "view-8.3",
-        [[
-            CREATE VIEW v7(a) AS SELECT pqr+xyz FROM v6;
-            SELECT * FROM v7 ORDER BY a;
-        ]], {
-            -- <view-8.3>
-            9, 18, 27, 39
-            -- </view-8.3>
-        })
-
-end
+test:do_execsql_test(
+    "view-8.3",
+    [[
+        CREATE VIEW v7(a) AS SELECT pqr+xyz FROM v6;
+        SELECT * FROM v7 ORDER BY a;
+    ]], {
+        -- <view-8.3>
+        9, 18, 27, 39
+        -- </view-8.3>
+    })
 
 test:do_execsql_test(
     "view-8.4",
@@ -638,7 +610,6 @@ test:do_execsql_test(
         -- </view-8.4>
     })
 
--- MUST_WORK_TEST
 test:do_execsql_test(
     "view-8.5",
     [[
@@ -649,7 +620,6 @@ test:do_execsql_test(
         -- </view-8.5>
     })
 
--- MUST_WORK_TEST
 test:do_execsql_test(
     "view-8.6",
     [[
@@ -660,7 +630,6 @@ test:do_execsql_test(
         -- </view-8.6>
     })
 
--- MUST_WORK_TEST
 test:do_execsql_test(
     "view-8.7",
     [[
@@ -692,7 +661,6 @@ test:do_execsql_test(
         -- </view-9.1>
     })
 
--- MUST_WORK_TEST order by
 test:do_execsql_test(
     "view-9.2",
     [[
@@ -703,7 +671,6 @@ test:do_execsql_test(
         -- </view-9.2>
     })
 
--- MUST_WORK_TEST order by
 test:do_execsql_test(
     "view-9.3",
     [[
@@ -716,7 +683,6 @@ test:do_execsql_test(
         -- </view-9.3>
     })
 
--- MUST_WORK_TEST order by
 test:do_execsql_test(
     "view-9.4",
     [[
@@ -727,7 +693,6 @@ test:do_execsql_test(
         -- </view-9.4>
     })
 
--- MUST_WORK_TEST ,"order","by"]]=])
 test:do_execsql_test(
     "view-9.5",
     [[
@@ -740,7 +705,6 @@ test:do_execsql_test(
         -- </view-9.5>
     })
 
--- MUST_WORK_TEST ,"order","by"]]=])
 test:do_execsql_test(
     "view-9.6",
     [[
@@ -1047,7 +1011,7 @@ test:do_execsql_test(
         CREATE VIEW v10 AS SELECT c1 FROM (SELECT t10.c1 FROM t10);
     ]], {
         -- <view-20.1>
-        
+
         -- </view-20.1>
     })
 
@@ -1060,7 +1024,7 @@ test:do_execsql_test(
         CREATE VIEW v10 AS SELECT c1 FROM (SELECT t10.c1 FROM t10);
     ]], {
         -- <view-20.1>
-        
+
         -- </view-20.1>
     })
 
@@ -1068,8 +1032,6 @@ test:do_execsql_test(
 if (0 > 0)
  then
     -- Ticket #d58ccbb3f1b"]],":"],"Prevent","Table.nRef","overflow.
-    --db("close")
-    --sql("db", ":memory:")
     test:execsql([[
         drop view v1;
         drop view v2;
@@ -1120,8 +1082,6 @@ if (0 > 0)
 
 
 
-    --db("close")
-    --sql("db", ":memory:")
     test:do_execsql_test(
         "view-22.1",
         [[
@@ -1133,6 +1093,9 @@ if (0 > 0)
             -- </view-22.1>
         })
 
+    -- Legacy from the original code. Must be replaced with analogue
+    -- functions from box.
+    local X = nil
     test:do_test(
         "view-22.2",
         function()

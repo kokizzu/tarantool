@@ -55,7 +55,11 @@ enum {
 	WAL_FALLOCATE_LEN = 1024 * 1024,
 };
 
-const char *wal_mode_STRS[] = { "none", "write", "fsync", NULL };
+const char *wal_mode_STRS[WAL_MODE_MAX] = {
+	[WAL_NONE]	= "none",
+	[WAL_WRITE]	= "write",
+	[WAL_FSYNC]	= "fsync",
+};
 
 int wal_dir_lock = -1;
 
@@ -274,6 +278,8 @@ tx_schedule_queue(struct stailq *queue)
 	struct journal_entry *req, *tmp;
 	stailq_foreach_entry_safe(req, tmp, queue, fifo)
 		journal_async_complete(req);
+
+	journal_queue_wakeup();
 }
 
 /**
@@ -600,7 +606,7 @@ wal_sync_f(struct cbus_call_msg *data)
 	struct wal_writer *writer = &wal_writer_singleton;
 	if (writer->is_in_rollback) {
 		/* We're rolling back a failed write. */
-		diag_set(ClientError, ER_WAL_IO);
+		diag_set(ClientError, ER_CASCADE_ROLLBACK);
 		return -1;
 	}
 	vclock_copy(&msg->vclock, &writer->vclock);
@@ -623,7 +629,7 @@ wal_sync(struct vclock *vclock)
 	}
 	if (!stailq_empty(&writer->rollback)) {
 		/* We're rolling back a failed write. */
-		diag_set(ClientError, ER_WAL_IO);
+		diag_set(ClientError, ER_CASCADE_ROLLBACK);
 		return -1;
 	}
 	bool cancellable = fiber_set_cancellable(false);
@@ -647,7 +653,7 @@ wal_begin_checkpoint_f(struct cbus_call_msg *data)
 		 * can't make a checkpoint - see the comment
 		 * in wal_begin_checkpoint() for the explanation.
 		 */
-		diag_set(ClientError, ER_CHECKPOINT_ROLLBACK);
+		diag_set(ClientError, ER_CASCADE_ROLLBACK);
 		return -1;
 	}
 	/*
@@ -685,7 +691,7 @@ wal_begin_checkpoint(struct wal_checkpoint *checkpoint)
 		 * the snapshot. So we abort checkpointing in this
 		 * case.
 		 */
-		diag_set(ClientError, ER_CHECKPOINT_ROLLBACK);
+		diag_set(ClientError, ER_CASCADE_ROLLBACK);
 		return -1;
 	}
 	bool cancellable = fiber_set_cancellable(false);
@@ -763,6 +769,12 @@ wal_set_checkpoint_threshold(int64_t threshold)
 		  &msg.base, wal_set_checkpoint_threshold_f, NULL,
 		  TIMEOUT_INFINITY);
 	fiber_set_cancellable(cancellable);
+}
+
+void
+wal_set_queue_max_size(int64_t size)
+{
+	journal_queue_set_max_size(size);
 }
 
 struct wal_gc_msg
@@ -851,10 +863,8 @@ wal_opt_rotate(struct wal_writer *writer)
 		return 0;
 
 	if (xdir_create_xlog(&writer->wal_dir, &writer->current_wal,
-			     &writer->vclock) != 0) {
-		diag_log();
+			     &writer->vclock) != 0)
 		return -1;
-	}
 	/*
 	 * Keep track of the new WAL vclock. Required for garbage
 	 * collection, see wal_collect_garbage().
@@ -954,14 +964,14 @@ out:
  */
 static void
 wal_assign_lsn(struct vclock *vclock_diff, struct vclock *base,
-	       struct xrow_header **row,
-	       struct xrow_header **end)
+	       struct journal_entry *entry)
 {
 	int64_t tsn = 0;
-	struct xrow_header **start = row;
-	struct xrow_header **first_glob_row = row;
+	struct xrow_header **start = entry->rows;
+	struct xrow_header **end = entry->rows + entry->n_rows;
+	struct xrow_header **first_glob_row = entry->rows;
 	/** Assign LSN to all local rows. */
-	for ( ; row < end; row++) {
+	for (struct xrow_header **row = start; row < end; row++) {
 		if ((*row)->replica_id == 0) {
 			/*
 			 * All rows representing local space data
@@ -988,18 +998,23 @@ wal_assign_lsn(struct vclock *vclock_diff, struct vclock *base,
 				first_glob_row = row;
 			}
 			(*row)->tsn = tsn == 0 ? (*start)->lsn : tsn;
-			(*row)->is_commit = row == end - 1;
+			/* Tx meta is stored in the last tx row. */
+			if (row == end - 1) {
+				(*row)->flags = entry->flags;
+				(*row)->is_commit = true;
+			}
 		} else {
 			int64_t diff = (*row)->lsn - vclock_get(base, (*row)->replica_id);
 			if (diff <= vclock_get(vclock_diff,
 					       (*row)->replica_id)) {
+				int64_t confirmed_lsn =
+					vclock_get(base, (*row)->replica_id) +
+					vclock_get(vclock_diff, (*row)->replica_id);
 				say_crit("Attempt to write a broken LSN to WAL:"
-					 " replica id: %d, confirmed lsn: %d,"
-					 " new lsn %d", (*row)->replica_id,
-					 vclock_get(base, (*row)->replica_id) +
-					 vclock_get(vclock_diff,
-						    (*row)->replica_id),
-						    (*row)->lsn);
+					 " replica id: %u, confirmed lsn: %lld,"
+					 " new lsn %lld", (*row)->replica_id,
+					 (long long)confirmed_lsn,
+					 (long long)(*row)->lsn);
 				assert(false);
 			} else {
 				vclock_follow(vclock_diff, (*row)->replica_id, diff);
@@ -1012,7 +1027,7 @@ wal_assign_lsn(struct vclock *vclock_diff, struct vclock *base,
 	 * the first global row. tsn was yet unknown when those
 	 * rows were processed.
 	 */
-	for (row = start; row < first_glob_row; row++)
+	for (struct xrow_header **row = start; row < first_glob_row; row++)
 		(*row)->tsn = tsn;
 }
 
@@ -1021,7 +1036,12 @@ wal_write_to_disk(struct cmsg *msg)
 {
 	struct wal_writer *writer = &wal_writer_singleton;
 	struct wal_msg *wal_msg = (struct wal_msg *) msg;
+	int err_code = JOURNAL_ENTRY_ERR_UNKNOWN;
+	struct stailq_entry *last_committed = NULL;
+	struct journal_entry *entry;
 	struct error *error;
+	if (stailq_empty(&wal_msg->commit))
+		panic("Attempted to write an empty batch to WAL");
 
 	/*
 	 * Track all vclock changes made by this batch into
@@ -1041,23 +1061,20 @@ wal_write_to_disk(struct cmsg *msg)
 
 	if (writer->is_in_rollback) {
 		/* We're rolling back a failed write. */
-		stailq_concat(&wal_msg->rollback, &wal_msg->commit);
-		vclock_copy(&wal_msg->vclock, &writer->vclock);
-		return;
+		err_code = JOURNAL_ENTRY_ERR_CASCADE;
+		goto done;
 	}
 
 	/* Xlog is only rotated between queue processing  */
 	if (wal_opt_rotate(writer) != 0) {
-		stailq_concat(&wal_msg->rollback, &wal_msg->commit);
-		vclock_copy(&wal_msg->vclock, &writer->vclock);
-		return wal_begin_rollback();
+		err_code = JOURNAL_ENTRY_ERR_IO;
+		goto done;
 	}
 
 	/* Ensure there's enough disk space before writing anything. */
 	if (wal_fallocate(writer, wal_msg->approx_len) != 0) {
-		stailq_concat(&wal_msg->rollback, &wal_msg->commit);
-		vclock_copy(&wal_msg->vclock, &writer->vclock);
-		return wal_begin_rollback();
+		err_code = JOURNAL_ENTRY_ERR_IO;
+		goto done;
 	}
 
 	/*
@@ -1087,16 +1104,15 @@ wal_write_to_disk(struct cmsg *msg)
 	 * Iterate over requests (transactions)
 	 */
 	int rc;
-	struct journal_entry *entry;
-	struct stailq_entry *last_committed = NULL;
 	stailq_foreach_entry(entry, &wal_msg->commit, fifo) {
-		wal_assign_lsn(&vclock_diff, &writer->vclock,
-			       entry->rows, entry->rows + entry->n_rows);
+		wal_assign_lsn(&vclock_diff, &writer->vclock, entry);
 		entry->res = vclock_sum(&vclock_diff) +
 			     vclock_sum(&writer->vclock);
 		rc = xlog_write_entry(l, entry);
-		if (rc < 0)
+		if (rc < 0) {
+			err_code = JOURNAL_ENTRY_ERR_IO;
 			goto done;
+		}
 		if (rc > 0) {
 			writer->checkpoint_wal_size += rc;
 			last_committed = &entry->fifo;
@@ -1105,8 +1121,10 @@ wal_write_to_disk(struct cmsg *msg)
 		/* rc == 0: the write is buffered in xlog_tx */
 	}
 	rc = xlog_flush(l);
-	if (rc < 0)
+	if (rc < 0) {
+		err_code= JOURNAL_ENTRY_ERR_IO;
 		goto done;
+	}
 
 	writer->checkpoint_wal_size += rc;
 	last_committed = stailq_last(&wal_msg->commit);
@@ -1158,12 +1176,15 @@ done:
 	stailq_cut_tail(&wal_msg->commit, last_committed, &rollback);
 
 	if (!stailq_empty(&rollback)) {
+		assert(err_code != JOURNAL_ENTRY_ERR_UNKNOWN);
 		/* Update status of the successfully committed requests. */
 		stailq_foreach_entry(entry, &rollback, fifo)
-			entry->res = -1;
+			entry->res = err_code;
 		/* Rollback unprocessed requests */
 		stailq_concat(&wal_msg->rollback, &rollback);
 		wal_begin_rollback();
+	} else {
+		assert(err_code == JOURNAL_ENTRY_ERR_UNKNOWN);
 	}
 	fiber_gc();
 	wal_notify_watchers(writer, WAL_EVENT_WRITE);
@@ -1228,6 +1249,7 @@ wal_write_async(struct journal *journal, struct journal_entry *entry)
 	struct wal_writer *writer = (struct wal_writer *) journal;
 
 	ERROR_INJECT(ERRINJ_WAL_IO, {
+		diag_set(ClientError, ER_WAL_IO);
 		goto fail;
 	});
 
@@ -1239,9 +1261,10 @@ wal_write_async(struct journal *journal, struct journal_entry *entry)
 		 * commit a transaction which has seen changes
 		 * that will be rolled back.
 		 */
-		say_error("Aborting transaction %llu during "
+		say_error("Aborting transaction %lld during "
 			  "cascading rollback",
-			  vclock_sum(&writer->vclock));
+			  (long long)vclock_sum(&writer->vclock));
+		diag_set(ClientError, ER_CASCADE_ROLLBACK);
 		goto fail;
 	}
 
@@ -1282,7 +1305,7 @@ wal_write_async(struct journal *journal, struct journal_entry *entry)
 	return 0;
 
 fail:
-	entry->res = -1;
+	assert(entry->res == JOURNAL_ENTRY_ERR_UNKNOWN);
 	return -1;
 }
 
@@ -1311,8 +1334,7 @@ wal_write_none_async(struct journal *journal,
 	struct vclock vclock_diff;
 
 	vclock_create(&vclock_diff);
-	wal_assign_lsn(&vclock_diff, &writer->vclock, entry->rows,
-		       entry->rows + entry->n_rows);
+	wal_assign_lsn(&vclock_diff, &writer->vclock, entry);
 	vclock_merge(&writer->vclock, &vclock_diff);
 	vclock_copy(&replicaset.vclock, &writer->vclock);
 	entry->res = vclock_sum(&writer->vclock);

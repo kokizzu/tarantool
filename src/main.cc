@@ -65,7 +65,7 @@
 #include "lua/init.h"
 #include "box/box.h"
 #include "box/error.h"
-#include "small/features.h"
+#include "small/small_features.h"
 #include "scoped_guard.h"
 #include "random.h"
 #include "cfg.h"
@@ -76,10 +76,13 @@
 #include "box/lua/init.h" /* box_lua_init() */
 #include "box/session.h"
 #include "box/memtx_tx.h"
+#include "box/module_cache.h"
 #include "systemd.h"
 #include "crypto/crypto.h"
 #include "core/popen.h"
 #include "core/crash.h"
+#include "ssl_cert_paths_discover.h"
+#include "core/errinj.h"
 
 static pid_t master_pid = getpid();
 static struct pidfh *pid_file_handle;
@@ -97,8 +100,6 @@ static double start_time;
 static struct fiber *on_shutdown_fiber = NULL;
 /** A flag restricting repeated execution of tarantool_exit(). */
 static bool is_shutting_down = false;
-/** A trigger which will break the event loop on shutdown. */
-static struct trigger break_loop_trigger;
 static int exit_code = 0;
 
 double
@@ -135,7 +136,9 @@ static int
 on_shutdown_f(va_list ap)
 {
 	(void) ap;
-	trigger_run(&box_on_shutdown, NULL);
+	trigger_fiber_run(&box_on_shutdown_trigger_list, NULL,
+			  on_shutdown_trigger_timeout);
+	ev_break(loop(), EVBREAK_ALL);
 	return 0;
 }
 
@@ -519,6 +522,7 @@ tarantool_free(void)
 	title_free(main_argc, main_argv);
 
 	popen_free();
+	module_free();
 
 	/* unlink pidfile. */
 	if (pid_file_handle != NULL && pidfile_remove(pid_file_handle) == -1)
@@ -578,13 +582,6 @@ print_help(const char *program)
 	puts("");
 	puts("Please visit project home page at http://tarantool.org");
 	puts("to see online documentation, submit bugs or contribute a patch.");
-}
-
-static int
-break_loop(struct trigger *, void *)
-{
-	ev_break(loop(), EVBREAK_ALL);
-	return 0;
 }
 
 extern "C" void **
@@ -708,8 +705,18 @@ main(int argc, char **argv)
 	cbus_init();
 	coll_init();
 	memtx_tx_manager_init();
+	module_init();
 	crypto_init();
 	systemd_init();
+
+	const int override_cert_paths_env_vars = 0;
+	int res = ssl_cert_paths_discover(override_cert_paths_env_vars);
+	if (res != 0)
+		say_warn("No enough memory for setup ssl certificates paths");
+
+#ifndef NDEBUG
+	errinj_set_with_environment_vars();
+#endif
 	tarantool_lua_init(tarantool_bin, main_argc, main_argv);
 
 	start_time = ev_monotonic_time();
@@ -730,13 +737,6 @@ main(int argc, char **argv)
 						 on_shutdown_f);
 		if (on_shutdown_fiber == NULL)
 			diag_raise();
-		/*
-		 * Register a on_shutdown trigger which will break the
-		 * main event loop. The trigger will be the last to run
-		 * since it's the first one we register.
-		 */
-		trigger_create(&break_loop_trigger, break_loop, NULL, NULL);
-		trigger_add(&box_on_shutdown, &break_loop_trigger);
 
 		/*
 		 * The call to tarantool_free() below, thanks to

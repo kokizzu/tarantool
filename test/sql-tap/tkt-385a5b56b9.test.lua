@@ -17,7 +17,6 @@ test:plan(9)
 --
 -- ["set","testdir",[["file","dirname",["argv0"]]]]
 -- ["source",[["testdir"],"\/tester.tcl"]]
-local testprefix = "tkt-385a5b56b9"
 test:do_execsql_test(
     "1.0",
     [[
@@ -30,7 +29,7 @@ test:do_execsql_test(
 test:do_execsql_test(
     "1.1",
     [[
-        SELECT DISTINCT x, y FROM t1 
+        SELECT DISTINCT x, y FROM t1
     ]], {
         -- <1.1>
         1, "", 2, ""
@@ -46,7 +45,7 @@ test:do_execsql_test(
 test:do_execsql_test(
     "1.3",
     [[
-        SELECT DISTINCT x, y FROM t1 
+        SELECT DISTINCT x, y FROM t1
     ]], {
         -- <1.3>
         1, "", 2, ""

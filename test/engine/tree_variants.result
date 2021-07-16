@@ -184,19 +184,23 @@ sort(space:select{})
 -- https://bugs.launchpad.net/tarantool/+bug/1072624
 space:insert{'', 1, 2, '', '', '', '', '', 0}
 ---
-- error: 'Tuple field 1 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 1 type does not match one required by operation: expected unsigned,
+    got string'
 ...
 space:insert{'xxxxxxxx', 1, 2, '', '', '', '', '', 0}
 ---
-- error: 'Tuple field 1 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 1 type does not match one required by operation: expected unsigned,
+    got string'
 ...
 space:insert{1, '', 2, '', '', '', '', '', 0}
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 2 type does not match one required by operation: expected unsigned,
+    got string'
 ...
 space:insert{1, 'xxxxxxxxxxx', 2, '', '', '', '', '', 0}
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 2 type does not match one required by operation: expected unsigned,
+    got string'
 ...
 space:drop()
 ---
@@ -249,7 +253,8 @@ old_index2_size = index2:bsize()
 ...
 space:insert({2, 'b', 4})
 ---
-- error: Duplicate key exists in unique index 'primary' in space 'test'
+- error: Duplicate key exists in unique index "primary" in space "test" with old tuple
+    - [2, "b", 4] and new tuple - [2, "b", 4]
 ...
 old_pk_size == pk:bsize()
 ---

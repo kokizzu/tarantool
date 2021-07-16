@@ -108,6 +108,7 @@ space_fill_index_map(struct space *space)
 		struct index *index = space->index_map[j];
 		if (index) {
 			assert(index_count < space->index_count);
+			index->dense_id = index_count;
 			space->index[index_count++] = index;
 		}
 	}
@@ -481,15 +482,6 @@ after_old_tuple_lookup:;
 	assert(stmt->old_tuple == NULL && stmt->new_tuple == NULL);
 	stmt->old_tuple = old_tuple;
 	stmt->new_tuple = new_tuple;
-	/*
-	 * A fake row attached to txn_stmt during execution
-	 * of before_replace triggers to store operation type.
-	 * It is pushed to the before_replace trigger in lua.
-	 */
-	struct xrow_header temp_header;
-	temp_header.type = type;
-	assert(stmt->row == NULL);
-	stmt->row = &temp_header;
 
 	int rc = trigger_run(&space->before_replace, txn);
 
@@ -502,7 +494,6 @@ after_old_tuple_lookup:;
 	assert(stmt->old_tuple == old_tuple);
 	stmt->old_tuple = NULL;
 	stmt->new_tuple = NULL;
-	stmt->row = NULL;
 
 	if (rc != 0)
 		goto out;

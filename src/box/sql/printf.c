@@ -10,6 +10,7 @@
  * sql.
  */
 #include "sqlInt.h"
+#include "mem.h"
 
 /*
  * Conversion types fall into various categories as defined by the
@@ -143,7 +144,7 @@ getIntArg(PrintfArguments * p)
 {
 	if (p->nArg <= p->nUsed)
 		return 0;
-	return sql_value_int64(p->apArg[p->nUsed++]);
+	return mem_get_int_unsafe(p->apArg[p->nUsed++]);
 }
 
 static double
@@ -151,7 +152,7 @@ getDoubleArg(PrintfArguments * p)
 {
 	if (p->nArg <= p->nUsed)
 		return 0.0;
-	return sql_value_double(p->apArg[p->nUsed++]);
+	return mem_get_double_unsafe(p->apArg[p->nUsed++]);
 }
 
 static char *
@@ -159,7 +160,8 @@ getTextArg(PrintfArguments * p)
 {
 	if (p->nArg <= p->nUsed)
 		return 0;
-	return (char *)sql_value_text(p->apArg[p->nUsed++]);
+	struct Mem *mem = p->apArg[p->nUsed++];
+	return (char *)mem_as_str0(mem);
 }
 
 /*

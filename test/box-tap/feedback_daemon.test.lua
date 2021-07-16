@@ -70,7 +70,7 @@ if not ok then
     os.exit(0)
 end
 
-test:plan(27)
+test:plan(30)
 
 local function check(message)
     while feedback_count < 1 do
@@ -93,28 +93,28 @@ feedback_reset()
 errinj.set("ERRINJ_HTTPC", false)
 check('feedback received after errinj')
 
-daemon.send_test()
+daemon.send()
 check("feedback received after explicit sending")
 
 box.cfg{feedback_enabled = false}
 feedback_reset()
-daemon.send_test()
+daemon.send()
 test:ok(feedback_count == 0, "no feedback after disabling")
 
 box.cfg{feedback_enabled = true}
-daemon.send_test()
+daemon.send()
 check("feedback after start")
 
 daemon.stop()
 feedback_reset()
-daemon.send_test()
+daemon.send()
 test:ok(feedback_count == 0, "no feedback after stop")
 
 daemon.start()
-daemon.send_test()
+daemon.send()
 check("feedback after start")
-daemon.send_test()
-check("feedback after feedback send_test")
+daemon.send()
+check("feedback after feedback send")
 
 daemon.stop()
 
@@ -123,9 +123,11 @@ local fio = require("fio")
 local fh = fio.open("feedback.json")
 test:ok(fh, "file is created")
 local file_data = fh:read()
--- Ignore the report time. The data should be equal other than that.
-feedback_save = string.gsub(feedback_save, '"time":(%d+)', 'time:0')
-file_data = string.gsub(file_data, '"time":(%d+)', 'time:0')
+-- Ignore the report time and uptime. The data should be equal other than that.
+feedback_save = string.gsub(feedback_save, '"uptime":(%d+)', '"uptime":0')
+file_data = string.gsub(file_data, '"uptime":(%d+)', '"uptime":0')
+feedback_save = string.gsub(feedback_save, '"time":(%d+)', '"time":0')
+file_data = string.gsub(file_data, '"time":(%d+)', '"time":0')
 test:is(file_data, feedback_save, "data is equal")
 fh:close()
 fio.unlink("feedback.json")
@@ -134,7 +136,7 @@ server:close()
 -- check it does not fail without server
 daemon = box.internal.feedback_daemon
 daemon.start()
-daemon.send_test()
+daemon.send()
 daemon.stop()
 
 --
@@ -287,6 +289,30 @@ actual = daemon.generate_feedback()
 test:is(fiber.time64(), actual.stats.time, "Time of report generation is correct")
 
 check_stats(actual.stats)
+
+actual = daemon.generate_feedback()
+test:is(box.info.uptime, actual.uptime, "Server uptime is reported and is correct.")
+
+daemon.reload()
+actual = daemon.generate_feedback()
+
+local events_expected = {}
+test:is_deeply(actual.events, events_expected, "Events are empty initially.")
+
+box.schema.space.create('test')
+box.space.test:create_index('pk')
+box.space.test.index.pk:drop()
+box.space.test:drop()
+
+actual = daemon.generate_feedback()
+events_expected = {
+    create_space = 1,
+    create_index = 1,
+    drop_space = 1,
+    drop_index = 1,
+}
+
+test:is_deeply(actual.events, events_expected, "Events are counted correctly")
 
 test:check()
 os.exit(0)

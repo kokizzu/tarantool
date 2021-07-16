@@ -51,8 +51,9 @@
 #include "lua/errno.h"
 #include "lua/socket.h"
 #include "lua/utils.h"
-#include "third_party/lua-cjson/lua_cjson.h"
-#include "third_party/lua-yaml/lyaml.h"
+#include "lua/serializer.h"
+#include <lua-cjson/lua_cjson.h>
+#include <lua-yaml/lyaml.h>
 #include "lua/msgpack.h"
 #include "lua/pickle.h"
 #include "lua/fio.h"
@@ -62,6 +63,7 @@
 #include "lua/swim.h"
 #include "lua/decimal.h"
 #include "digest.h"
+#include "errinj.h"
 #include <small/ibuf.h>
 
 #include <ctype.h>
@@ -72,8 +74,6 @@
  * The single Lua state of the transaction processor (tx) thread.
  */
 struct lua_State *tarantool_L;
-static struct ibuf tarantool_lua_ibuf_body;
-struct ibuf *tarantool_lua_ibuf = &tarantool_lua_ibuf_body;
 /**
  * The fiber running the startup Lua script
  */
@@ -107,6 +107,7 @@ extern char strict_lua[],
 	vmdef_lua[],
 	bc_lua[],
 	bcsave_lua[],
+	dis_arm64_lua[],
 	dis_x86_lua[],
 	dis_x64_lua[],
 	dump_lua[],
@@ -126,6 +127,7 @@ extern char strict_lua[],
 	bufread_lua[],
 	symtab_lua[],
 	parse_lua[],
+	process_lua[],
 	humanize_lua[],
 	memprof_lua[]
 ;
@@ -167,6 +169,7 @@ static const char *lua_modules[] = {
 	"jit.vmdef", vmdef_lua,
 	"jit.bc", bc_lua,
 	"jit.bcsave", bcsave_lua,
+	"jit.dis_arm64", dis_arm64_lua,
 	"jit.dis_x86", dis_x86_lua,
 	"jit.dis_x64", dis_x64_lua,
 	"jit.dump", dump_lua,
@@ -178,6 +181,7 @@ static const char *lua_modules[] = {
 	"utils.bufread", bufread_lua,
 	"utils.symtab", symtab_lua,
 	"memprof.parse", parse_lua,
+	"memprof.process", process_lua,
 	"memprof.humanize", humanize_lua,
 	"memprof", memprof_lua,
 	NULL
@@ -452,7 +456,6 @@ tarantool_lua_init(const char *tarantool_bin, int argc, char **argv)
 	if (L == NULL) {
 		panic("failed to initialize Lua");
 	}
-	ibuf_create(tarantool_lua_ibuf, tarantool_lua_slab_cache(), 16000);
 	luaL_openlibs(L);
 	tarantool_lua_setpaths(L);
 
@@ -473,6 +476,7 @@ tarantool_lua_init(const char *tarantool_bin, int argc, char **argv)
 	tarantool_lua_socket_init(L);
 	tarantool_lua_pickle_init(L);
 	tarantool_lua_digest_init(L);
+	tarantool_lua_serializer_init(L);
 	tarantool_lua_swim_init(L);
 	tarantool_lua_decimal_init(L);
 	luaopen_http_client_driver(L);
@@ -583,6 +587,7 @@ run_script_f(va_list ap)
 	 */
 	struct diag *diag = va_arg(ap, struct diag *);
 	bool aux_loop_is_run = false;
+	bool is_option_e_ran = false;
 
 	/*
 	 * Load libraries and execute chunks passed by -l and -e
@@ -613,6 +618,7 @@ run_script_f(va_list ap)
 			if (luaT_call(L, 0, 0) != 0)
 				goto error;
 			lua_settop(L, 0);
+			is_option_e_ran = true;
 			break;
 		default:
 			unreachable(); /* checked by getopt() in main() */
@@ -627,25 +633,38 @@ run_script_f(va_list ap)
 	fiber_sleep(0.0);
 	aux_loop_is_run = true;
 
+	int is_a_tty = isatty(STDIN_FILENO);
+	/*
+	 * Override return value of isatty(STDIN_FILENO) if
+	 * ERRINJ_STDIN_ISATTY enabled (iparam not set to default).
+	 * Use iparam in such case, standard return value otherwise.
+	 * Integer param of errinj is used in order to set different
+	 * return values.
+	*/
+	ERROR_INJECT_INT(ERRINJ_STDIN_ISATTY, inj->iparam >= 0, {
+		is_a_tty = inj->iparam;
+	});
+
 	if (path && strcmp(path, "-") != 0 && access(path, F_OK) == 0) {
 		/* Execute script. */
 		if (luaL_loadfile(L, path) != 0)
 			goto luajit_error;
 		if (lua_main(L, argc, argv) != 0)
 			goto error;
-	} else if (!isatty(STDIN_FILENO) || (path && strcmp(path, "-") == 0)) {
+	} else if (!is_a_tty || (path && strcmp(path, "-") == 0)) {
 		/* Execute stdin */
 		if (luaL_loadfile(L, NULL) != 0)
 			goto luajit_error;
 		if (lua_main(L, argc, argv) != 0)
 			goto error;
-	} else {
+	} else if (!is_option_e_ran) {
 		interactive = true;
 	}
 
 	/*
-	 * Start interactive mode when it was explicitly requested
-	 * by "-i" option or stdin is TTY or there are no script.
+	 * Start interactive mode in any of the cases:
+	 * - it was explicitly requested by "-i" option;
+	 * - stdin is TTY and there are no script (-e is considered as a script).
 	 */
 	if (interactive) {
 		say_crit("%s %s\ntype 'help' for interactive help",
@@ -699,8 +718,16 @@ tarantool_lua_run_script(char *path, bool interactive,
 	if (script_fiber == NULL)
 		panic("%s", diag_last_error(diag_get())->errmsg);
 	script_fiber->storage.lua.stack = tarantool_L;
+	/*
+	 * Create a new diag on the stack. Don't pass fiber's diag, because it
+	 * might be overwritten by libev callbacks invoked in the scheduler
+	 * fiber (which is this), and therefore can't be used as a sign of fail
+	 * in the script itself.
+	 */
+	struct diag script_diag;
+	diag_create(&script_diag);
 	fiber_start(script_fiber, tarantool_L, path, interactive,
-		    optc, optv, argc, argv, diag_get());
+		    optc, optv, argc, argv, &script_diag);
 
 	/*
 	 * Run an auxiliary event loop to re-schedule run_script fiber.
@@ -710,6 +737,8 @@ tarantool_lua_run_script(char *path, bool interactive,
 		ev_run(loop(), 0);
 	/* The fiber running the startup script has ended. */
 	script_fiber = NULL;
+	diag_move(&script_diag, diag_get());
+	diag_destroy(&script_diag);
 	/*
 	 * Result can't be obtained via fiber_join - script fiber
 	 * never dies if os.exit() was called. This is why diag

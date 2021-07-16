@@ -59,6 +59,13 @@
 
 STRS(applier_state, applier_STATE);
 
+enum {
+	/**
+	 * How often to log received row count. Used during join and register.
+	 */
+	ROWS_PER_LOG = 100000,
+};
+
 static inline void
 applier_set_state(struct applier *applier, enum applier_state state)
 {
@@ -109,6 +116,8 @@ applier_log_error(struct applier *applier, struct error *e)
 	case ER_PASSWORD_MISMATCH:
 	case ER_XLOG_GAP:
 	case ER_TOO_EARLY_SUBSCRIBE:
+	case ER_SYNC_QUORUM_TIMEOUT:
+	case ER_SYNC_ROLLBACK:
 		say_info("will retry every %.2lf second",
 			 replication_reconnect_interval());
 		break;
@@ -154,6 +163,9 @@ applier_writer_f(va_list ap)
 	struct ev_io io;
 	coio_create(&io, applier->io.fd);
 
+	/* ID is permanent while applier is alive */
+	uint32_t replica_id = applier->instance_id;
+
 	while (!fiber_is_cancelled()) {
 		/*
 		 * Tarantool >= 1.7.7 sends periodic heartbeat
@@ -184,6 +196,16 @@ applier_writer_f(va_list ap)
 			applier->has_acks_to_send = false;
 			struct xrow_header xrow;
 			xrow_encode_vclock(&xrow, &replicaset.vclock);
+			/*
+			 * For relay lag statistics we report last
+			 * written transaction timestamp in tm field.
+			 *
+			 * If user delete the node from _cluster space,
+			 * we obtain a nil pointer here.
+			 */
+			struct replica *r = replica_by_id(replica_id);
+			if (likely(r != NULL))
+				xrow.tm = r->applier_txn_last_tm;
 			coio_write_xrow(&io, &xrow);
 			ERROR_INJECT(ERRINJ_APPLIER_SLOW_ACK, {
 				fiber_sleep(0.01);
@@ -237,8 +259,8 @@ apply_snapshot_row(struct xrow_header *row)
 	 * Do not wait for confirmation when fetching a snapshot.
 	 * Master only sends confirmed rows during join.
 	 */
-	txn_set_flag(txn, TXN_FORCE_ASYNC);
-	if (txn_begin_stmt(txn, space) != 0)
+	txn_set_flags(txn, TXN_FORCE_ASYNC);
+	if (txn_begin_stmt(txn, space, request.type) != 0)
 		goto rollback;
 	/* no access checks here - applier always works with admin privs */
 	struct tuple *unused;
@@ -252,7 +274,7 @@ apply_snapshot_row(struct xrow_header *row)
 rollback_stmt:
 	txn_rollback_stmt(txn);
 rollback:
-	txn_rollback(txn);
+	txn_abort(txn);
 	fiber_gc();
 	return -1;
 }
@@ -268,7 +290,7 @@ process_nop(struct request *request)
 {
 	assert(request->type == IPROTO_NOP);
 	struct txn *txn = in_txn();
-	if (txn_begin_stmt(txn, NULL) != 0)
+	if (txn_begin_stmt(txn, NULL, request->type) != 0)
 		return -1;
 	return txn_commit_stmt(txn, request);
 }
@@ -289,34 +311,6 @@ apply_row(struct xrow_header *row)
 		say_error("error applying row: %s", request_str(&request));
 		return -1;
 	}
-	return 0;
-}
-
-static int
-apply_final_join_row(struct xrow_header *row)
-{
-	/*
-	 * Confirms are ignored during join. All the data master
-	 * sends us is valid.
-	 */
-	if (iproto_type_is_synchro_request(row->type))
-		return 0;
-	struct txn *txn = txn_begin();
-	if (txn == NULL)
-		return -1;
-	/*
-	 * Do not wait for confirmation while processing final
-	 * join rows. See apply_snapshot_row().
-	 */
-	txn_set_flag(txn, TXN_FORCE_ASYNC);
-	if (apply_row(row) != 0) {
-		txn_rollback(txn);
-		fiber_gc();
-		return -1;
-	}
-	if (txn_commit(txn) != 0)
-		return -1;
-	fiber_gc();
 	return 0;
 }
 
@@ -463,7 +457,7 @@ applier_wait_snapshot(struct applier *applier)
 		if (iproto_type_is_dml(row.type)) {
 			if (apply_snapshot_row(&row) != 0)
 				diag_raise();
-			if (++row_count % 100000 == 0)
+			if (++row_count % ROWS_PER_LOG == 0)
 				say_info("%.1fM rows received", row_count / 1e6);
 		} else if (row.type == IPROTO_OK) {
 			if (applier->version_id < version_id(1, 7, 0)) {
@@ -506,12 +500,24 @@ applier_fetch_snapshot(struct applier *applier)
 }
 
 static uint64_t
+applier_read_tx(struct applier *applier, struct stailq *rows, double timeout);
+
+static int
+apply_final_join_tx(uint32_t replica_id, struct stailq *rows);
+
+/**
+ * A helper struct to link xrow objects in a list.
+ */
+struct applier_tx_row {
+	/* Next transaction row. */
+	struct stailq_entry next;
+	/* xrow_header struct for the current transaction row. */
+	struct xrow_header row;
+};
+
+static uint64_t
 applier_wait_register(struct applier *applier, uint64_t row_count)
 {
-	struct ev_io *coio = &applier->io;
-	struct ibuf *ibuf = &applier->ibuf;
-	struct xrow_header row;
-
 	/*
 	 * Tarantool < 1.7.0: there is no "final join" stage.
 	 * Proceed to "subscribe" and do not finish bootstrap
@@ -520,38 +526,37 @@ applier_wait_register(struct applier *applier, uint64_t row_count)
 	if (applier->version_id < version_id(1, 7, 0))
 		return row_count;
 
+	uint64_t next_log_cnt =
+		row_count + ROWS_PER_LOG - row_count % ROWS_PER_LOG;
 	/*
 	 * Receive final data.
 	 */
 	while (true) {
-		coio_read_xrow(coio, ibuf, &row);
-		applier->last_row_time = ev_monotonic_now(loop());
-		if (iproto_type_is_dml(row.type)) {
-			vclock_follow_xrow(&replicaset.vclock, &row);
-			if (apply_final_join_row(&row) != 0)
-				diag_raise();
-			if (++row_count % 100000 == 0)
-				say_info("%.1fM rows received", row_count / 1e6);
-		} else if (row.type == IPROTO_OK) {
-			/*
-			 * Current vclock. This is not used now,
-			 * ignore.
-			 */
-			++row_count;
-			break; /* end of stream */
-		} else if (iproto_type_is_error(row.type)) {
-			xrow_decode_error_xc(&row);  /* rethrow error */
-		} else {
-			tnt_raise(ClientError, ER_UNKNOWN_REQUEST_TYPE,
-				  (uint32_t) row.type);
+		struct stailq rows;
+		row_count += applier_read_tx(applier, &rows, TIMEOUT_INFINITY);
+		while (row_count >= next_log_cnt) {
+			say_info("%.1fM rows received", next_log_cnt / 1e6);
+			next_log_cnt += ROWS_PER_LOG;
 		}
+		struct xrow_header *first_row =
+			&stailq_first_entry(&rows, struct applier_tx_row,
+					    next)->row;
+		if (first_row->type == IPROTO_OK) {
+			/* Current vclock. This is not used now, ignore. */
+			assert(first_row ==
+			       &stailq_last_entry(&rows, struct applier_tx_row,
+						  next)->row);
+			break;
+		}
+		if (apply_final_join_tx(applier->instance_id, &rows) != 0)
+			diag_raise();
 	}
 
 	return row_count;
 }
 
 static void
-applier_register(struct applier *applier)
+applier_register(struct applier *applier, bool was_anon)
 {
 	/* Send REGISTER request */
 	struct ev_io *coio = &applier->io;
@@ -566,9 +571,16 @@ applier_register(struct applier *applier)
 	row.type = IPROTO_REGISTER;
 	coio_write_xrow(coio, &row);
 
-	applier_set_state(applier, APPLIER_REGISTER);
+	/*
+	 * Register may serve as a retry for final join. Set corresponding
+	 * states to unblock anyone who's waiting for final join to start or
+	 * end.
+	 */
+	applier_set_state(applier, was_anon ? APPLIER_REGISTER :
+					      APPLIER_FINAL_JOIN);
 	applier_wait_register(applier, 0);
-	applier_set_state(applier, APPLIER_REGISTERED);
+	applier_set_state(applier, was_anon ? APPLIER_REGISTERED :
+					      APPLIER_JOINED);
 	applier_set_state(applier, APPLIER_READY);
 }
 
@@ -609,18 +621,8 @@ applier_join(struct applier *applier)
 	applier_set_state(applier, APPLIER_READY);
 }
 
-/**
- * A helper struct to link xrow objects in a list.
- */
-struct applier_tx_row {
-	/* Next transaction row. */
-	struct stailq_entry next;
-	/* xrow_header struct for the current transaction row. */
-	struct xrow_header row;
-};
-
 static struct applier_tx_row *
-applier_read_tx_row(struct applier *applier)
+applier_read_tx_row(struct applier *applier, double timeout)
 {
 	struct ev_io *coio = &applier->io;
 	struct ibuf *ibuf = &applier->ibuf;
@@ -633,21 +635,71 @@ applier_read_tx_row(struct applier *applier)
 
 	struct xrow_header *row = &tx_row->row;
 
-	double timeout = replication_disconnect_timeout();
-	/*
-	 * Tarantool < 1.7.7 does not send periodic heartbeat
-	 * messages so we can't assume that if we haven't heard
-	 * from the master for quite a while the connection is
-	 * broken - the master might just be idle.
-	 */
-	if (applier->version_id < version_id(1, 7, 7))
-		coio_read_xrow(coio, ibuf, row);
-	else
-		coio_read_xrow_timeout_xc(coio, ibuf, row, timeout);
+	ERROR_INJECT_YIELD(ERRINJ_APPLIER_READ_TX_ROW_DELAY);
+
+	coio_read_xrow_timeout_xc(coio, ibuf, row, timeout);
 
 	applier->lag = ev_now(loop()) - row->tm;
 	applier->last_row_time = ev_monotonic_now(loop());
 	return tx_row;
+}
+
+static int64_t
+set_next_tx_row(struct stailq *rows, struct applier_tx_row *tx_row, int64_t tsn)
+{
+	struct xrow_header *row = &tx_row->row;
+
+	if (iproto_type_is_error(row->type))
+		xrow_decode_error_xc(row);
+
+	/* Replication request. */
+	if (row->replica_id >= VCLOCK_MAX) {
+		/*
+		 * A safety net, this can only occur if we're fed a strangely
+		 * broken xlog. row->replica_id == 0, when reading heartbeats
+		 * from an anonymous instance.
+		 */
+		tnt_raise(ClientError, ER_UNKNOWN_REPLICA,
+			  int2str(row->replica_id),
+			  tt_uuid_str(&REPLICASET_UUID));
+	}
+	if (tsn == 0) {
+		/*
+		 * Transaction id must be derived from the log sequence number
+		 * of the first row in the transaction.
+		 */
+		tsn = row->tsn;
+		if (row->lsn != tsn)
+			tnt_raise(ClientError, ER_PROTOCOL,
+				  "Transaction id must be equal to LSN of the "
+				  "first row in the transaction.");
+	} else if (tsn != row->tsn) {
+		tnt_raise(ClientError, ER_UNSUPPORTED, "replication",
+			  "interleaving transactions");
+	}
+
+	assert(row->bodycnt <= 1);
+	if (row->is_commit) {
+		/* Signal the caller that we've reached the tx end. */
+		tsn = 0;
+	} else if (row->bodycnt == 1) {
+		/*
+		 * Save row body to gc region. Not done for single-statement
+		 * transactions and the last row of multi-statement transactions
+		 * knowing that the input buffer will not be used while the
+		 * transaction is applied.
+		 */
+		void *new_base = region_alloc(&fiber()->gc, row->body->iov_len);
+		if (new_base == NULL)
+			tnt_raise(OutOfMemory, row->body->iov_len, "region",
+				  "xrow body");
+		memcpy(new_base, row->body->iov_base, row->body->iov_len);
+		/* Adjust row body pointers. */
+		row->body->iov_base = new_base;
+	}
+
+	stailq_add_tail(rows, &tx_row->next);
+	return tsn;
 }
 
 /**
@@ -657,75 +709,24 @@ applier_read_tx_row(struct applier *applier)
  * rpos is adjusted as xrow is decoded and the corresponding
  * network input space is reused for the next xrow.
  */
-static void
-applier_read_tx(struct applier *applier, struct stailq *rows)
+static uint64_t
+applier_read_tx(struct applier *applier, struct stailq *rows, double timeout)
 {
 	int64_t tsn = 0;
+	uint64_t row_count = 0;
 
 	stailq_create(rows);
 	do {
-		struct applier_tx_row *tx_row = applier_read_tx_row(applier);
-		struct xrow_header *row = &tx_row->row;
-
-		if (iproto_type_is_error(row->type))
-			xrow_decode_error_xc(row);
-
-		/* Replication request. */
-		if (row->replica_id >= VCLOCK_MAX) {
-			/*
-			 * A safety net, this can only occur
-			 * if we're fed a strangely broken xlog.
-			 * row->replica_id == 0, when reading
-			 * heartbeats from an anonymous instance.
-			 */
-			tnt_raise(ClientError, ER_UNKNOWN_REPLICA,
-				  int2str(row->replica_id),
-				  tt_uuid_str(&REPLICASET_UUID));
-		}
-		if (tsn == 0) {
-			/*
-			 * Transaction id must be derived from the log sequence
-			 * number of the first row in the transaction.
-			 */
-			tsn = row->tsn;
-			if (row->lsn != tsn)
-				tnt_raise(ClientError, ER_PROTOCOL,
-					  "Transaction id must be equal to "
-					  "LSN of the first row in the "
-					  "transaction.");
-		}
-		if (tsn != row->tsn)
-			tnt_raise(ClientError, ER_UNSUPPORTED,
-				  "replication",
-				  "interleaving transactions");
-
-		assert(row->bodycnt <= 1);
-		if (row->bodycnt == 1 && !row->is_commit) {
-			/*
-			 * Save row body to gc region.
-			 * Not done for single-statement
-			 * transactions knowing that the input
-			 * buffer will not be used while the
-			 * transaction is applied.
-			 */
-			void *new_base = region_alloc(&fiber()->gc,
-						      row->body->iov_len);
-			if (new_base == NULL)
-				tnt_raise(OutOfMemory, row->body->iov_len,
-					  "region", "xrow body");
-			memcpy(new_base, row->body->iov_base,
-			       row->body->iov_len);
-			/* Adjust row body pointers. */
-			row->body->iov_base = new_base;
-		}
-		stailq_add_tail(rows, &tx_row->next);
-
-	} while (!stailq_last_entry(rows, struct applier_tx_row,
-				    next)->row.is_commit);
+		struct applier_tx_row *tx_row = applier_read_tx_row(applier,
+								    timeout);
+		tsn = set_next_tx_row(rows, tx_row, tsn);
+		++row_count;
+	} while (tsn != 0);
+	return row_count;
 }
 
 static void
-applier_rollback_by_wal_io(void)
+applier_rollback_by_wal_io(int64_t signature)
 {
 	/*
 	 * Setup shared applier diagnostic area.
@@ -739,7 +740,7 @@ applier_rollback_by_wal_io(void)
 	 * rollback may happen a way later after it was passed to
 	 * the journal engine.
 	 */
-	diag_set(ClientError, ER_WAL_IO);
+	diag_set_txn_sign(signature);
 	diag_set_error(&replicaset.applier.diag,
 		       diag_last_error(diag_get()));
 
@@ -761,40 +762,61 @@ applier_txn_rollback_cb(struct trigger *trigger, void *event)
 	 * special handling.
 	 */
 	if (txn->signature != TXN_SIGNATURE_SYNC_ROLLBACK)
-		applier_rollback_by_wal_io();
+		applier_rollback_by_wal_io(txn->signature);
 	return 0;
+}
+
+struct replica_cb_data {
+	/** Replica ID the data belongs to. */
+	uint32_t replica_id;
+	/**
+	 * Timestamp of a transaction to be accounted
+	 * for relay lag. Usually it is a last row in
+	 * a transaction.
+	 */
+	double txn_last_tm;
+};
+
+/** Update replica associated data once write is complete. */
+static void
+replica_txn_wal_write_cb(struct replica_cb_data *rcb)
+{
+	struct replica *r = replica_by_id(rcb->replica_id);
+	if (likely(r != NULL))
+		r->applier_txn_last_tm = rcb->txn_last_tm;
 }
 
 static int
 applier_txn_wal_write_cb(struct trigger *trigger, void *event)
 {
-	(void) trigger;
 	(void) event;
+
+	struct replica_cb_data *rcb =
+		(struct replica_cb_data *)trigger->data;
+	replica_txn_wal_write_cb(rcb);
+
 	/* Broadcast the WAL write across all appliers. */
 	trigger_run(&replicaset.applier.on_wal_write, NULL);
 	return 0;
 }
 
 struct synchro_entry {
-	/** Encoded form of a synchro record. */
-	struct synchro_body_bin	body_bin;
-
-	/** xrow to write, used by the journal engine. */
-	struct xrow_header row;
-
+	/** Request to process when WAL write is done. */
+	struct synchro_request *req;
+	/** Fiber created the entry. To wakeup when WAL write is done. */
+	struct fiber *owner;
+	/** Replica associated data. */
+	struct replica_cb_data *rcb;
 	/**
-	 * The journal entry itself. Note since
-	 * it has unsized array it must be the
-	 * last entry in the structure.
+	 * The base journal entry. It has unsized array and then must be the
+	 * last entry in the structure. But can workaround it via a union
+	 * adding the needed tail as char[].
 	 */
-	struct journal_entry journal_entry;
+	union {
+		struct journal_entry base;
+		char base_buf[sizeof(base) + sizeof(base.rows[0])];
+	};
 };
-
-static void
-synchro_entry_delete(struct synchro_entry *entry)
-{
-	free(entry);
-}
 
 /**
  * Async write journal completion.
@@ -805,55 +827,19 @@ apply_synchro_row_cb(struct journal_entry *entry)
 	assert(entry->complete_data != NULL);
 	struct synchro_entry *synchro_entry =
 		(struct synchro_entry *)entry->complete_data;
-	if (entry->res < 0)
-		applier_rollback_by_wal_io();
-	else
+	if (entry->res < 0) {
+		applier_rollback_by_wal_io(entry->res);
+	} else {
+		replica_txn_wal_write_cb(synchro_entry->rcb);
+		txn_limbo_process(&txn_limbo, synchro_entry->req);
 		trigger_run(&replicaset.applier.on_wal_write, NULL);
-
-	synchro_entry_delete(synchro_entry);
-}
-
-/**
- * Allocate a new synchro_entry to be passed to
- * the journal engine in async write way.
- */
-static struct synchro_entry *
-synchro_entry_new(struct xrow_header *applier_row,
-		  struct synchro_request *req)
-{
-	struct synchro_entry *entry;
-	size_t size = sizeof(*entry) + sizeof(struct xrow_header *);
-
-	/*
-	 * For simplicity we use malloc here but
-	 * probably should provide some cache similar
-	 * to txn cache.
-	 */
-	entry = (struct synchro_entry *)malloc(size);
-	if (entry == NULL) {
-		diag_set(OutOfMemory, size, "malloc", "synchro_entry");
-		return NULL;
 	}
-
-	struct journal_entry *journal_entry = &entry->journal_entry;
-	struct synchro_body_bin *body_bin = &entry->body_bin;
-	struct xrow_header *row = &entry->row;
-
-	journal_entry->rows[0] = row;
-
-	xrow_encode_synchro(row, body_bin, req);
-
-	row->lsn = applier_row->lsn;
-	row->replica_id = applier_row->replica_id;
-
-	journal_entry_create(journal_entry, 1, xrow_approx_len(row),
-			     apply_synchro_row_cb, entry);
-	return entry;
+	fiber_wakeup(synchro_entry->owner);
 }
 
 /** Process a synchro request. */
 static int
-apply_synchro_row(struct xrow_header *row)
+apply_synchro_row(uint32_t replica_id, struct xrow_header *row)
 {
 	assert(iproto_type_is_synchro_request(row->type));
 
@@ -861,15 +847,46 @@ apply_synchro_row(struct xrow_header *row)
 	if (xrow_decode_synchro(row, &req) != 0)
 		goto err;
 
-	txn_limbo_process(&txn_limbo, &req);
+	struct replica_cb_data rcb_data;
+	struct synchro_entry entry;
+	/*
+	 * Rows array is cast from *[] to **, because otherwise g++ complains
+	 * about out of array bounds access.
+	 */
+	struct xrow_header **rows;
+	rows = entry.base.rows;
+	rows[0] = row;
+	journal_entry_create(&entry.base, 1, xrow_approx_len(row),
+			     apply_synchro_row_cb, &entry);
+	entry.req = &req;
+	entry.owner = fiber();
 
-	struct synchro_entry *entry;
-	entry = synchro_entry_new(row, &req);
-	if (entry == NULL)
+	rcb_data.replica_id = replica_id;
+	rcb_data.txn_last_tm = row->tm;
+	entry.rcb = &rcb_data;
+
+	/*
+	 * The WAL write is blocking. Otherwise it might happen that a CONFIRM
+	 * or ROLLBACK is sent to WAL, and it would empty the limbo, but before
+	 * it is written, more transactions arrive with a different owner. They
+	 * won't be able to enter the limbo due to owner ID mismatch. Hence the
+	 * synchro rows must block receipt of new transactions.
+	 *
+	 * Don't forget to return -1 both if the journal write failed right
+	 * away, and if it failed inside of WAL thread (res < 0). Otherwise the
+	 * caller would propagate committed vclock to this row thinking it was
+	 * a success.
+	 *
+	 * XXX: in theory it could be done vice-versa. The write could be made
+	 * non-blocking, and instead the potentially conflicting transactions
+	 * could try to wait for all the current synchro WAL writes to end
+	 * before trying to commit. But that requires extra steps from the
+	 * transactions side, including the async ones.
+	 */
+	if (journal_write(&entry.base) != 0)
 		goto err;
-
-	if (journal_write_async(&entry->journal_entry) != 0) {
-		diag_set(ClientError, ER_WAL_IO);
+	if (entry.base.res < 0) {
+		diag_set_journal_res(entry.base.res);
 		goto err;
 	}
 	return 0;
@@ -895,6 +912,184 @@ applier_handle_raft(struct applier *applier, struct xrow_header *row)
 	return box_raft_process(&req, applier->instance_id);
 }
 
+static int
+apply_plain_tx(uint32_t replica_id, struct stailq *rows,
+	       bool skip_conflict, bool use_triggers)
+{
+	/*
+	 * Explicitly begin the transaction so that we can
+	 * control fiber->gc life cycle and, in case of apply
+	 * conflict safely access failed xrow object and allocate
+	 * IPROTO_NOP on gc.
+	 */
+	struct txn *txn = txn_begin();
+	struct applier_tx_row *item;
+	if (txn == NULL)
+		 return -1;
+
+	stailq_foreach_entry(item, rows, next) {
+		struct xrow_header *row = &item->row;
+		int res = apply_row(row);
+		if (res != 0 && skip_conflict) {
+			struct error *e = diag_last_error(diag_get());
+			/*
+			 * In case of ER_TUPLE_FOUND error and enabled
+			 * replication_skip_conflict configuration
+			 * option, skip applying the foreign row and
+			 * replace it with NOP in the local write ahead
+			 * log.
+			 */
+			if (e->type == &type_ClientError &&
+			    box_error_code(e) == ER_TUPLE_FOUND) {
+				diag_clear(diag_get());
+				row->type = IPROTO_NOP;
+				row->bodycnt = 0;
+				res = apply_row(row);
+			}
+		}
+		if (res != 0)
+			goto fail;
+	}
+
+	/*
+	 * We are going to commit so it's a high time to check if
+	 * the current transaction has non-local effects.
+	 */
+	if (txn_is_distributed(txn)) {
+		/*
+		 * A transaction mixes remote and local rows.
+		 * Local rows must be replicated back, which
+		 * doesn't make sense since the master likely has
+		 * new changes which local rows may overwrite.
+		 * Raise an error.
+		 */
+		diag_set(ClientError, ER_UNSUPPORTED, "Replication",
+			 "distributed transactions");
+		goto fail;
+	}
+
+	if (use_triggers) {
+		/* We are ready to submit txn to wal. */
+		struct trigger *on_rollback, *on_wal_write;
+		size_t size;
+		on_rollback = region_alloc_object(&txn->region, typeof(*on_rollback),
+						  &size);
+		on_wal_write = region_alloc_object(&txn->region, typeof(*on_wal_write),
+						   &size);
+		if (on_rollback == NULL || on_wal_write == NULL) {
+			diag_set(OutOfMemory, size, "region_alloc_object",
+				 "on_rollback/on_wal_write");
+			goto fail;
+		}
+
+		struct replica_cb_data *rcb;
+		rcb = region_alloc_object(&txn->region, typeof(*rcb), &size);
+		if (rcb == NULL) {
+			diag_set(OutOfMemory, size, "region_alloc_object", "rcb");
+			goto fail;
+		}
+
+		trigger_create(on_rollback, applier_txn_rollback_cb, NULL, NULL);
+		txn_on_rollback(txn, on_rollback);
+
+		/*
+		 * We use *last* entry timestamp because ack comes up to
+		 * last entry in transaction. Same time this shows more
+		 * precise result because we're interested in how long
+		 * transaction traversed network + remote WAL bundle before
+		 * ack get received.
+		 */
+		item = stailq_last_entry(rows, struct applier_tx_row, next);
+		rcb->replica_id = replica_id;
+		rcb->txn_last_tm = item->row.tm;
+
+		trigger_create(on_wal_write, applier_txn_wal_write_cb, rcb, NULL);
+		txn_on_wal_write(txn, on_wal_write);
+	}
+
+	return txn_commit_try_async(txn);
+fail:
+	txn_abort(txn);
+	return -1;
+}
+
+/** A simpler version of applier_apply_tx() for final join stage. */
+static int
+apply_final_join_tx(uint32_t replica_id, struct stailq *rows)
+{
+	struct xrow_header *first_row =
+		&stailq_first_entry(rows, struct applier_tx_row, next)->row;
+	struct xrow_header *last_row =
+		&stailq_last_entry(rows, struct applier_tx_row, next)->row;
+	int rc = 0;
+	/* WAL isn't enabled yet, so follow vclock manually. */
+	vclock_follow_xrow(&replicaset.vclock, last_row);
+	if (unlikely(iproto_type_is_synchro_request(first_row->type))) {
+		assert(first_row == last_row);
+		rc = apply_synchro_row(replica_id, first_row);
+	} else {
+		rc = apply_plain_tx(replica_id, rows, false, false);
+	}
+	fiber_gc();
+	return rc;
+}
+
+/**
+ * When elections are enabled we must filter out synchronous rows coming
+ * from an instance that fell behind the current leader. This includes
+ * both synchronous tx rows and rows for txs following unconfirmed
+ * synchronous transactions.
+ * The rows are replaced with NOPs to preserve the vclock consistency.
+ */
+static void
+applier_synchro_filter_tx(struct stailq *rows)
+{
+	/*
+	 * XXX: in case raft is disabled, synchronous replication still works
+	 * but without any filtering. That might lead to issues with
+	 * unpredictable confirms after rollbacks which are supposed to be
+	 * fixed by the filtering.
+	 */
+	if (!raft_is_enabled(box_raft()))
+		return;
+	struct xrow_header *row;
+	/*
+	 * It  may happen that we receive the instance's rows via some third
+	 * node, so cannot check for applier->instance_id here.
+	 */
+	row = &stailq_first_entry(rows, struct applier_tx_row, next)->row;
+	if (!txn_limbo_is_replica_outdated(&txn_limbo, row->replica_id))
+		return;
+
+	if (stailq_last_entry(rows, struct applier_tx_row, next)->row.wait_sync)
+		goto nopify;
+
+	/*
+	 * Not waiting for sync and not a synchro request - this make it already
+	 * NOP or an asynchronous transaction not depending on any synchronous
+	 * ones - let it go as is.
+	 */
+	if (!iproto_type_is_synchro_request(row->type))
+		return;
+	/*
+	 * Do not NOPify promotion, otherwise won't even know who is the limbo
+	 * owner now.
+	 */
+	if (iproto_type_is_promote_request(row->type))
+		return;
+nopify:;
+	struct applier_tx_row *item;
+	stailq_foreach_entry(item, rows, next) {
+		row = &item->row;
+		row->type = IPROTO_NOP;
+		/*
+		 * Row body is saved to fiber's region and will be freed
+		 * on next fiber_gc() call.
+		 */
+		row->bodycnt = 0;
+	}
+}
+
 /**
  * Apply all rows in the rows queue as a single transaction.
  *
@@ -904,23 +1099,27 @@ static int
 applier_apply_tx(struct applier *applier, struct stailq *rows)
 {
 	/*
-	 * Rows received not directly from a leader are ignored. That is a
-	 * protection against the case when an old leader keeps sending data
-	 * around not knowing yet that it is not a leader anymore.
+	 * Initially we've been filtering out data if it came from
+	 * an applier which instance_id doesn't match raft->leader,
+	 * but this prevents from obtaining valid leader's data when
+	 * it comes from intermediate node. For example a series of
+	 * replica hops
 	 *
-	 * XXX: it may be that this can be fine to apply leader transactions by
-	 * looking at their replica_id field if it is equal to leader id. That
-	 * can be investigated as an 'optimization'. Even though may not give
-	 * anything, because won't change total number of rows sent in the
-	 * network anyway.
+	 *  master -> replica 1 -> replica 2
+	 *
+	 * where each replica carries master's initiated transaction
+	 * in xrow->replica_id field and master's data get propagated
+	 * indirectly.
+	 *
+	 * Finally we dropped such "sender" filtration and use transaction
+	 * "initiator" filtration via xrow->replica_id only.
 	 */
-	if (!raft_is_source_allowed(box_raft(), applier->instance_id))
-		return 0;
 	struct xrow_header *first_row = &stailq_first_entry(rows,
 					struct applier_tx_row, next)->row;
 	struct xrow_header *last_row;
 	last_row = &stailq_last_entry(rows, struct applier_tx_row, next)->row;
 	struct replica *replica = replica_by_id(first_row->replica_id);
+	int rc = 0;
 	/*
 	 * In a full mesh topology, the same set of changes
 	 * may arrive via two concurrently running appliers.
@@ -932,8 +1131,7 @@ applier_apply_tx(struct applier *applier, struct stailq *rows)
 	latch_lock(latch);
 	if (vclock_get(&replicaset.applier.vclock,
 		       last_row->replica_id) >= last_row->lsn) {
-		latch_unlock(latch);
-		return 0;
+		goto finish;
 	} else if (vclock_get(&replicaset.applier.vclock,
 			      first_row->replica_id) >= first_row->lsn) {
 		/*
@@ -954,7 +1152,7 @@ applier_apply_tx(struct applier *applier, struct stailq *rows)
 			}
 		}
 	}
-
+	applier_synchro_filter_tx(rows);
 	if (unlikely(iproto_type_is_synchro_request(first_row->type))) {
 		/*
 		 * Synchro messages are not transactions, in terms
@@ -962,105 +1160,20 @@ applier_apply_tx(struct applier *applier, struct stailq *rows)
 		 * each other.
 		 */
 		assert(first_row == last_row);
-		if (apply_synchro_row(first_row) != 0)
-			diag_raise();
-		goto success;
+		rc = apply_synchro_row(applier->instance_id, first_row);
+	} else {
+		rc = apply_plain_tx(applier->instance_id, rows,
+				    replication_skip_conflict, true);
 	}
+	if (rc != 0)
+		goto finish;
 
-	/**
-	 * Explicitly begin the transaction so that we can
-	 * control fiber->gc life cycle and, in case of apply
-	 * conflict safely access failed xrow object and allocate
-	 * IPROTO_NOP on gc.
-	 */
-	struct txn *txn;
-	txn = txn_begin();
-	struct applier_tx_row *item;
-	if (txn == NULL) {
-		latch_unlock(latch);
-		return -1;
-	}
-	stailq_foreach_entry(item, rows, next) {
-		struct xrow_header *row = &item->row;
-		int res = apply_row(row);
-		if (res != 0) {
-			struct error *e = diag_last_error(diag_get());
-			/*
-			 * In case of ER_TUPLE_FOUND error and enabled
-			 * replication_skip_conflict configuration
-			 * option, skip applying the foreign row and
-			 * replace it with NOP in the local write ahead
-			 * log.
-			 */
-			if (e->type == &type_ClientError &&
-			    box_error_code(e) == ER_TUPLE_FOUND &&
-			    replication_skip_conflict) {
-				diag_clear(diag_get());
-				row->type = IPROTO_NOP;
-				row->bodycnt = 0;
-				res = apply_row(row);
-			}
-		}
-		if (res != 0)
-			goto rollback;
-	}
-	/*
-	 * We are going to commit so it's a high time to check if
-	 * the current transaction has non-local effects.
-	 */
-	if (txn_is_distributed(txn)) {
-		/*
-		 * A transaction mixes remote and local rows.
-		 * Local rows must be replicated back, which
-		 * doesn't make sense since the master likely has
-		 * new changes which local rows may overwrite.
-		 * Raise an error.
-		 */
-		diag_set(ClientError, ER_UNSUPPORTED,
-			 "Replication", "distributed transactions");
-		goto rollback;
-	}
-
-	/* We are ready to submit txn to wal. */
-	struct trigger *on_rollback, *on_wal_write;
-	size_t size;
-	on_rollback = region_alloc_object(&txn->region, typeof(*on_rollback),
-					  &size);
-	on_wal_write = region_alloc_object(&txn->region, typeof(*on_wal_write),
-					   &size);
-	if (on_rollback == NULL || on_wal_write == NULL) {
-		diag_set(OutOfMemory, size, "region_alloc_object",
-			 "on_rollback/on_wal_write");
-		goto rollback;
-	}
-
-	trigger_create(on_rollback, applier_txn_rollback_cb, NULL, NULL);
-	txn_on_rollback(txn, on_rollback);
-
-	trigger_create(on_wal_write, applier_txn_wal_write_cb, NULL, NULL);
-	txn_on_wal_write(txn, on_wal_write);
-
-	if (txn_commit_async(txn) < 0)
-		goto fail;
-
-success:
-	/*
-	 * The transaction was sent to journal so promote vclock.
-	 *
-	 * Use the lsn of the last row to guard from 1.10
-	 * instances, which send every single tx row as a separate
-	 * transaction.
-	 */
 	vclock_follow(&replicaset.applier.vclock, last_row->replica_id,
 		      last_row->lsn);
-	latch_unlock(latch);
-	return 0;
-rollback:
-	txn_rollback(txn);
-fail:
+finish:
 	latch_unlock(latch);
 	fiber_gc();
-	return -1;
+	return rc;
 }
 
 /**
@@ -1244,10 +1357,19 @@ applier_subscribe(struct applier *applier)
 			applier_set_state(applier, APPLIER_FOLLOW);
 		}
 
-		struct stailq rows;
-		applier_read_tx(applier, &rows);
+		/*
+		 * Tarantool < 1.7.7 does not send periodic heartbeat
+		 * messages so we can't assume that if we haven't heard
+		 * from the master for quite a while the connection is
+		 * broken - the master might just be idle.
+		 */
+		double timeout = applier->version_id < version_id(1, 7, 7) ?
+				 TIMEOUT_INFINITY :
+				 replication_disconnect_timeout();
 
-		applier->last_row_time = ev_monotonic_now(loop());
+		struct stailq rows;
+		applier_read_tx(applier, &rows, timeout);
+
 		/*
 		 * In case of an heartbeat message wake a writer up
 		 * and check applier state.
@@ -1270,7 +1392,6 @@ applier_subscribe(struct applier *applier)
 
 		if (ibuf_used(ibuf) == 0)
 			ibuf_reset(ibuf);
-		fiber_gc();
 	}
 }
 
@@ -1303,6 +1424,14 @@ applier_f(va_list ap)
 		return -1;
 	session_set_type(session, SESSION_TYPE_APPLIER);
 
+	/*
+	 * The instance saves replication_anon value on bootstrap.
+	 * If a freshly started instance sees it has received
+	 * REPLICASET_UUID but hasn't yet registered, it must be an
+	 * anonymous replica, hence the default value 'true'.
+	 */
+	bool was_anon = true;
+
 	/* Re-connect loop */
 	while (!fiber_is_cancelled()) {
 		try {
@@ -1316,6 +1445,7 @@ applier_f(va_list ap)
 				 * The join will pause the applier
 				 * until WAL is created.
 				 */
+				was_anon = replication_anon;
 				if (replication_anon)
 					applier_fetch_snapshot(applier);
 				else
@@ -1324,11 +1454,10 @@ applier_f(va_list ap)
 			if (instance_id == REPLICA_ID_NIL &&
 			    !replication_anon) {
 				/*
-				 * The instance transitioned
-				 * from anonymous. Register it
-				 * now.
+				 * The instance transitioned from anonymous or
+				 * is retrying final join.
 				 */
-				applier_register(applier);
+				applier_register(applier, was_anon);
 			}
 			applier_subscribe(applier);
 			/*

@@ -35,6 +35,7 @@
  * time functions, are implemented separately.)
  */
 #include "sqlInt.h"
+#include "mem.h"
 #include "vdbeInt.h"
 #include "version.h"
 #include "coll/coll.h"
@@ -46,12 +47,53 @@
 #include <unicode/ucol.h>
 #include "box/coll_id_cache.h"
 #include "box/schema.h"
-#include "box/func.h"
-#include "box/port.h"
-#include "box/tuple.h"
-#include "lua/msgpack.h"
-#include "lua/utils.h"
-#include "mpstream/mpstream.h"
+
+static const unsigned char *
+mem_as_ustr(struct Mem *mem)
+{
+	return (const unsigned char *)mem_as_str0(mem);
+}
+
+static const void *
+mem_as_bin(struct Mem *mem)
+{
+	const char *s;
+	if (mem_cast_implicit(mem, FIELD_TYPE_VARBINARY) != 0 &&
+	    mem_to_str(mem) != 0)
+		return NULL;
+	if (mem_get_bin(mem, &s) != 0)
+		return NULL;
+	return s;
+}
+
+static void
+sql_func_uuid(struct sql_context *ctx, int argc, struct Mem **argv)
+{
+	if (argc > 1) {
+		diag_set(ClientError, ER_FUNC_WRONG_ARG_COUNT, "UUID",
+			 "one or zero", argc);
+		ctx->is_aborted = true;
+		return;
+	}
+	if (argc == 1) {
+		uint64_t version;
+		if (mem_get_uint(argv[0], &version) != 0) {
+			diag_set(ClientError, ER_SQL_TYPE_MISMATCH,
+				 mem_str(argv[0]), "integer");
+			ctx->is_aborted = true;
+			return;
+		}
+		if (version != 4) {
+			diag_set(ClientError, ER_UNSUPPORTED, "Function UUID",
+				 "versions other than 4");
+			ctx->is_aborted = true;
+			return;
+		}
+	}
+	struct tt_uuid uuid;
+	tt_uuid_create(&uuid);
+	mem_set_uuid(ctx->pOut, &uuid);
+}
 
 /*
  * Return the collating function associated with a function.
@@ -77,306 +119,6 @@ sqlSkipAccumulatorLoad(sql_context * context)
 	context->skipFlag = 1;
 }
 
-/**
- * Allocate a sequence of initialized vdbe memory registers
- * on region.
- */
-static struct Mem *
-vdbemem_alloc_on_region(uint32_t count)
-{
-	struct region *region = &fiber()->gc;
-	size_t size;
-	struct Mem *ret = region_alloc_array(region, typeof(*ret), count,
-					     &size);
-	if (ret == NULL) {
-		diag_set(OutOfMemory, size, "region_alloc_array", "ret");
-		return NULL;
-	}
-	memset(ret, 0, count * sizeof(*ret));
-	for (uint32_t i = 0; i < count; i++) {
-		sqlVdbeMemInit(&ret[i], sql_get(), MEM_Null);
-		assert(memIsValid(&ret[i]));
-	}
-	return ret;
-}
-
-static void
-port_vdbemem_dump_lua(struct port *base, struct lua_State *L, bool is_flat)
-{
-	(void) is_flat;
-	struct port_vdbemem *port = (struct port_vdbemem *) base;
-	assert(is_flat == true);
-	for (uint32_t i = 0; i < port->mem_count; i++) {
-		sql_value *param =
-			(sql_value *)((struct Mem *)port->mem + i);
-		switch (sql_value_type(param)) {
-		case MP_INT:
-			luaL_pushint64(L, sql_value_int64(param));
-			break;
-		case MP_UINT:
-			luaL_pushuint64(L, sql_value_uint64(param));
-			break;
-		case MP_DOUBLE:
-			lua_pushnumber(L, sql_value_double(param));
-			break;
-		case MP_STR:
-			lua_pushstring(L, (const char *) sql_value_text(param));
-			break;
-		case MP_BIN:
-		case MP_ARRAY:
-		case MP_MAP:
-			lua_pushlstring(L, sql_value_blob(param),
-					(size_t) sql_value_bytes(param));
-			break;
-		case MP_NIL:
-			lua_pushnil(L);
-			break;
-		case MP_BOOL:
-			lua_pushboolean(L, sql_value_boolean(param));
-			break;
-		default:
-			unreachable();
-		}
-	}
-}
-
-static const char *
-port_vdbemem_get_msgpack(struct port *base, uint32_t *size)
-{
-	struct port_vdbemem *port = (struct port_vdbemem *) base;
-	struct region *region = &fiber()->gc;
-	size_t region_svp = region_used(region);
-	bool is_error = false;
-	struct mpstream stream;
-	mpstream_init(&stream, region, region_reserve_cb, region_alloc_cb,
-		      set_encode_error, &is_error);
-	mpstream_encode_array(&stream, port->mem_count);
-	for (uint32_t i = 0; i < port->mem_count && !is_error; i++) {
-		sql_value *param =
-			(sql_value *)((struct Mem *)port->mem + i);
-		switch (sql_value_type(param)) {
-		case MP_INT: {
-			sql_int64 val = sql_value_int64(param);
-			if (val < 0) {
-				mpstream_encode_int(&stream, val);
-				break;
-			}
-			FALLTHROUGH;
-		}
-		case MP_UINT: {
-			sql_uint64 val = sql_value_uint64(param);
-			mpstream_encode_uint(&stream, val);
-			break;
-		}
-		case MP_DOUBLE: {
-			mpstream_encode_double(&stream,
-					       sql_value_double(param));
-			break;
-		}
-		case MP_STR: {
-			const char *str = (const char *) sql_value_text(param);
-			mpstream_encode_str(&stream, str);
-			break;
-		}
-		case MP_BIN:
-		case MP_ARRAY:
-		case MP_MAP: {
-			mpstream_encode_binl(&stream, sql_value_bytes(param));
-			mpstream_memcpy(&stream, sql_value_blob(param),
-					sql_value_bytes(param));
-			break;
-		}
-		case MP_NIL: {
-			mpstream_encode_nil(&stream);
-			break;
-		}
-		case MP_BOOL: {
-			mpstream_encode_bool(&stream, sql_value_boolean(param));
-			break;
-		}
-		default:
-			unreachable();
-		}
-	}
-	mpstream_flush(&stream);
-	*size = region_used(region) - region_svp;
-	if (is_error)
-		goto error;
-	const char *ret = (char *)region_join(region, *size);
-	if (ret == NULL)
-		goto error;
-	return ret;
-error:
-	diag_set(OutOfMemory, *size, "region", "ret");
-	return NULL;
-}
-
-static const struct port_vtab port_vdbemem_vtab;
-
-void
-port_vdbemem_create(struct port *base, struct sql_value *mem,
-		    uint32_t mem_count)
-{
-	struct port_vdbemem *port = (struct port_vdbemem *) base;
-	port->vtab = &port_vdbemem_vtab;
-	port->mem = mem;
-	port->mem_count = mem_count;
-}
-
-static struct sql_value *
-port_vdbemem_get_vdbemem(struct port *base, uint32_t *mem_count)
-{
-	struct port_vdbemem *port = (struct port_vdbemem *) base;
-	assert(port->vtab == &port_vdbemem_vtab);
-	*mem_count = port->mem_count;
-	return port->mem;
-}
-
-static const struct port_vtab port_vdbemem_vtab = {
-	.dump_msgpack = NULL,
-	.dump_msgpack_16 = NULL,
-	.dump_lua = port_vdbemem_dump_lua,
-	.dump_plain = NULL,
-	.get_msgpack = port_vdbemem_get_msgpack,
-	.get_vdbemem = port_vdbemem_get_vdbemem,
-	.destroy = NULL,
-};
-
-struct sql_value *
-port_lua_get_vdbemem(struct port *base, uint32_t *size)
-{
-	struct port_lua *port = (struct port_lua *) base;
-	struct lua_State *L = port->L;
-	int argc = lua_gettop(L);
-	if (argc == 0 || argc > 1) {
-		diag_set(ClientError, ER_SQL_FUNC_WRONG_RET_COUNT, "Lua", argc);
-		return NULL;
-	}
-	*size = argc;
-	/** FIXME: Implement an ability to return a vector. */
-	assert(*size == 1);
-	struct region *region = &fiber()->gc;
-	size_t region_svp = region_used(region);
-	struct Mem *val = vdbemem_alloc_on_region(argc);
-	if (val == NULL)
-		return NULL;
-	for (int i = 0; i < argc; i++) {
-		struct luaL_field field;
-		if (luaL_tofield(L, luaL_msgpack_default,
-				 NULL, -1 - i, &field) < 0) {
-			goto error;
-		}
-		switch (field.type) {
-		case MP_BOOL:
-			mem_set_bool(&val[i], field.bval);
-			break;
-		case MP_FLOAT:
-			mem_set_double(&val[i], field.fval);
-			break;
-		case MP_DOUBLE:
-			mem_set_double(&val[i], field.dval);
-			break;
-		case MP_INT:
-			mem_set_i64(&val[i], field.ival);
-			break;
-		case MP_UINT:
-			mem_set_u64(&val[i], field.ival);
-			break;
-		case MP_STR:
-			if (sqlVdbeMemSetStr(&val[i], field.sval.data,
-					     field.sval.len, 1,
-					     SQL_TRANSIENT) != 0)
-				goto error;
-			break;
-		case MP_NIL:
-			sqlVdbeMemSetNull(&val[i]);
-			break;
-		default:
-			diag_set(ClientError, ER_SQL_EXECUTE,
-				 "Unsupported type passed from Lua");
-			goto error;
-		}
-	}
-	return (struct sql_value *)val;
-error:
-	for (int i = 0; i < argc; i++)
-		sqlVdbeMemRelease(&val[i]);
-	region_truncate(region, region_svp);
-	return NULL;
-}
-
-struct sql_value *
-port_c_get_vdbemem(struct port *base, uint32_t *size)
-{
-	struct port_c *port = (struct port_c *)base;
-	*size = port->size;
-	if (*size == 0 || *size > 1) {
-		diag_set(ClientError, ER_SQL_FUNC_WRONG_RET_COUNT, "C", *size);
-		return NULL;
-	}
-	/** FIXME: Implement an ability to return a vector. */
-	assert(*size == 1);
-	struct region *region = &fiber()->gc;
-	size_t region_svp = region_used(region);
-	struct Mem *val = vdbemem_alloc_on_region(port->size);
-	if (val == NULL)
-		return NULL;
-	int i = 0;
-	const char *data;
-	struct port_c_entry *pe;
-	for (pe = port->first; pe != NULL; pe = pe->next) {
-		if (pe->mp_size == 0) {
-			data = tuple_data(pe->tuple);
-			if (mp_decode_array(&data) != 1) {
-				diag_set(ClientError, ER_SQL_EXECUTE,
-					 "Unsupported type passed from C");
-				goto error;
-			}
-		} else {
-			data = pe->mp;
-		}
-		uint32_t len;
-		const char *str;
-		switch (mp_typeof(*data)) {
-		case MP_BOOL:
-			mem_set_bool(&val[i], mp_decode_bool(&data));
-			break;
-		case MP_FLOAT:
-			mem_set_double(&val[i], mp_decode_float(&data));
-			break;
-		case MP_DOUBLE:
-			mem_set_double(&val[i], mp_decode_double(&data));
-			break;
-		case MP_INT:
-			mem_set_i64(&val[i], mp_decode_int(&data));
-			break;
-		case MP_UINT:
-			mem_set_u64(&val[i], mp_decode_uint(&data));
-			break;
-		case MP_STR:
-			str = mp_decode_str(&data, &len);
-			if (sqlVdbeMemSetStr(&val[i], str, len,
-					     1, SQL_TRANSIENT) != 0)
-				goto error;
-			break;
-		case MP_NIL:
-			sqlVdbeMemSetNull(&val[i]);
-			break;
-		default:
-			diag_set(ClientError, ER_SQL_EXECUTE,
-				 "Unsupported type passed from C");
-			goto error;
-		}
-		i++;
-	}
-	return (struct sql_value *) val;
-error:
-	for (int i = 0; i < port->size; i++)
-		sqlVdbeMemRelease(&val[i]);
-	region_truncate(region, region_svp);
-	return NULL;
-}
-
 /*
  * Implementation of the non-aggregate min() and max() functions
  */
@@ -397,10 +139,10 @@ minmaxFunc(sql_context * context, int argc, sql_value ** argv)
 	pColl = sqlGetFuncCollSeq(context);
 	assert(mask == -1 || mask == 0);
 	iBest = 0;
-	if (sql_value_is_null(argv[0]))
+	if (mem_is_null(argv[0]))
 		return;
 	for (i = 1; i < argc; i++) {
-		if (sql_value_is_null(argv[i]))
+		if (mem_is_null(argv[i]))
 			return;
 		if ((sqlMemCompare(argv[iBest], argv[i], pColl) ^ mask) >=
 		    0) {
@@ -430,25 +172,28 @@ typeofFunc(sql_context * context, int NotUsed, sql_value ** argv)
 				-1, SQL_STATIC);
 		return;
 	}
-	switch (sql_value_type(argv[0])) {
-	case MP_INT:
-	case MP_UINT:
+	switch (argv[0]->type) {
+	case MEM_TYPE_INT:
+	case MEM_TYPE_UINT:
 		z = "integer";
 		break;
-	case MP_STR:
+	case MEM_TYPE_STR:
 		z = "string";
 		break;
-	case MP_DOUBLE:
+	case MEM_TYPE_DOUBLE:
 		z = "double";
 		break;
-	case MP_BIN:
-	case MP_ARRAY:
-	case MP_MAP:
+	case MEM_TYPE_BIN:
+	case MEM_TYPE_ARRAY:
+	case MEM_TYPE_MAP:
 		z = "varbinary";
 		break;
-	case MP_BOOL:
-	case MP_NIL:
+	case MEM_TYPE_BOOL:
+	case MEM_TYPE_NULL:
 		z = "boolean";
+		break;
+	case MEM_TYPE_UUID:
+		z = "uuid";
 		break;
 	default:
 		unreachable();
@@ -475,14 +220,16 @@ lengthFunc(sql_context * context, int argc, sql_value ** argv)
 	case MP_UINT:
 	case MP_BOOL:
 	case MP_DOUBLE:{
-			sql_result_uint(context, sql_value_bytes(argv[0]));
+			mem_as_bin(argv[0]);
+			sql_result_uint(context, mem_len_unsafe(argv[0]));
 			break;
 		}
+	case MP_EXT:
 	case MP_STR:{
-			const unsigned char *z = sql_value_text(argv[0]);
+			const unsigned char *z = mem_as_ustr(argv[0]);
 			if (z == 0)
 				return;
-			len = sql_utf8_char_count(z, sql_value_bytes(argv[0]));
+			len = sql_utf8_char_count(z, mem_len_unsafe(argv[0]));
 			sql_result_uint(context, len);
 			break;
 		}
@@ -506,11 +253,11 @@ absFunc(sql_context * context, int argc, sql_value ** argv)
 	UNUSED_PARAMETER(argc);
 	switch (sql_value_type(argv[0])) {
 	case MP_UINT: {
-		sql_result_uint(context, sql_value_uint64(argv[0]));
+		sql_result_uint(context, mem_get_uint_unsafe(argv[0]));
 		break;
 	}
 	case MP_INT: {
-		int64_t value = sql_value_int64(argv[0]);
+		int64_t value = mem_get_int_unsafe(argv[0]);
 		assert(value < 0);
 		sql_result_uint(context, -value);
 		break;
@@ -522,20 +269,20 @@ absFunc(sql_context * context, int argc, sql_value ** argv)
 		}
 	case MP_BOOL:
 	case MP_BIN:
+	case MP_EXT:
 	case MP_ARRAY:
 	case MP_MAP: {
 		diag_set(ClientError, ER_INCONSISTENT_TYPES, "number",
-			 mem_type_to_str(argv[0]));
+			 mem_str(argv[0]));
 		context->is_aborted = true;
 		return;
 	}
 	default:{
-			/* Because sql_value_double() returns 0.0 if the argument is not
-			 * something that can be converted into a number, we have:
-			 * IMP: R-01992-00519 Abs(X) returns 0.0 if X is a string or blob
+			/*
+			 * Abs(X) returns 0.0 if X is a string or blob
 			 * that cannot be converted to a numeric value.
 			 */
-			double rVal = sql_value_double(argv[0]);
+			double rVal = mem_get_double_unsafe(argv[0]);
 			if (rVal < 0)
 				rVal = -rVal;
 			sql_result_double(context, rVal);
@@ -577,8 +324,7 @@ position_func(struct sql_context *context, int argc, struct Mem **argv)
 		inconsistent_type_arg = haystack;
 	if (inconsistent_type_arg != NULL) {
 		diag_set(ClientError, ER_INCONSISTENT_TYPES,
-			 "text or varbinary",
-			 mem_type_to_str(inconsistent_type_arg));
+			 "string or varbinary", mem_str(inconsistent_type_arg));
 		context->is_aborted = true;
 		return;
 	}
@@ -588,20 +334,20 @@ position_func(struct sql_context *context, int argc, struct Mem **argv)
 	 */
 	if (haystack_type != needle_type) {
 		diag_set(ClientError, ER_INCONSISTENT_TYPES,
-			 mem_type_to_str(needle), mem_type_to_str(haystack));
+			 mem_type_to_str(needle), mem_str(haystack));
 		context->is_aborted = true;
 		return;
 	}
 
-	int n_needle_bytes = sql_value_bytes(needle);
-	int n_haystack_bytes = sql_value_bytes(haystack);
+	int n_needle_bytes = mem_len_unsafe(needle);
+	int n_haystack_bytes = mem_len_unsafe(haystack);
 	int position = 1;
 	if (n_needle_bytes > 0) {
 		const unsigned char *haystack_str;
 		const unsigned char *needle_str;
 		if (haystack_type == MP_BIN) {
-			needle_str = sql_value_blob(needle);
-			haystack_str = sql_value_blob(haystack);
+			needle_str = mem_as_bin(needle);
+			haystack_str = mem_as_bin(haystack);
 			assert(needle_str != NULL);
 			assert(haystack_str != NULL || n_haystack_bytes == 0);
 			/*
@@ -629,8 +375,8 @@ position_func(struct sql_context *context, int argc, struct Mem **argv)
 			 * Character size is equal to
 			 * needle char size.
 			 */
-			haystack_str = sql_value_text(haystack);
-			needle_str = sql_value_text(needle);
+			haystack_str = mem_as_ustr(haystack);
+			needle_str = mem_as_ustr(needle);
 
 			int n_needle_chars =
 				sql_utf8_char_count(needle_str, n_needle_bytes);
@@ -692,8 +438,7 @@ printfFunc(sql_context * context, int argc, sql_value ** argv)
 	int n;
 	sql *db = sql_context_db_handle(context);
 
-	if (argc >= 1
-	    && (zFormat = (const char *)sql_value_text(argv[0])) != 0) {
+	if (argc >= 1 && (zFormat = mem_as_str0(argv[0])) != NULL) {
 		x.nArg = argc - 1;
 		x.nUsed = 0;
 		x.apArg = argv + 1;
@@ -726,7 +471,7 @@ substrFunc(sql_context * context, int argc, sql_value ** argv)
 	const unsigned char *z2;
 	int len;
 	int p0type;
-	i64 p1, p2;
+	int64_t p1, p2;
 	int negP2 = 0;
 
 	if (argc != 2 && argc != 3) {
@@ -735,29 +480,26 @@ substrFunc(sql_context * context, int argc, sql_value ** argv)
 		context->is_aborted = true;
 		return;
 	}
-	if (sql_value_is_null(argv[1])
-	    || (argc == 3 && sql_value_is_null(argv[2]))
-	    ) {
+	if (mem_is_null(argv[1]) || (argc == 3 && mem_is_null(argv[2])))
 		return;
-	}
 	p0type = sql_value_type(argv[0]);
-	p1 = sql_value_int(argv[1]);
+	p1 = mem_get_int_unsafe(argv[1]);
 	if (p0type == MP_BIN) {
-		len = sql_value_bytes(argv[0]);
-		z = sql_value_blob(argv[0]);
+		z = mem_as_bin(argv[0]);
+		len = mem_len_unsafe(argv[0]);
 		if (z == 0)
 			return;
-		assert(len == sql_value_bytes(argv[0]));
+		assert(len == mem_len_unsafe(argv[0]));
 	} else {
-		z = sql_value_text(argv[0]);
+		z = mem_as_ustr(argv[0]);
 		if (z == 0)
 			return;
 		len = 0;
 		if (p1 < 0)
-			len = sql_utf8_char_count(z, sql_value_bytes(argv[0]));
+			len = sql_utf8_char_count(z, mem_len_unsafe(argv[0]));
 	}
 	if (argc == 3) {
-		p2 = sql_value_int(argv[2]);
+		p2 = mem_get_int_unsafe(argv[2]);
 		if (p2 < 0) {
 			p2 = -p2;
 			negP2 = 1;
@@ -793,7 +535,7 @@ substrFunc(sql_context * context, int argc, sql_value ** argv)
 		 * used because '\0' is not supposed to be
 		 * end-of-string symbol.
 		 */
-		int byte_size = sql_value_bytes(argv[0]);
+		int byte_size = mem_len_unsafe(argv[0]);
 		int n_chars = sql_utf8_char_count(z, byte_size);
 		int cnt = 0;
 		int i = 0;
@@ -828,7 +570,7 @@ substrFunc(sql_context * context, int argc, sql_value ** argv)
 static void
 roundFunc(sql_context * context, int argc, sql_value ** argv)
 {
-	int n = 0;
+	int64_t n = 0;
 	double r;
 	if (argc != 1 && argc != 2) {
 		diag_set(ClientError, ER_FUNC_WRONG_ARG_COUNT, "ROUND",
@@ -837,22 +579,21 @@ roundFunc(sql_context * context, int argc, sql_value ** argv)
 		return;
 	}
 	if (argc == 2) {
-		if (sql_value_is_null(argv[1]))
+		if (mem_is_null(argv[1]))
 			return;
-		n = sql_value_int(argv[1]);
+		n = mem_get_int_unsafe(argv[1]);
 		if (n < 0)
 			n = 0;
 	}
-	if (sql_value_is_null(argv[0]))
+	if (mem_is_null(argv[0]))
 		return;
-	enum mp_type mp_type = sql_value_type(argv[0]);
-	if (mp_type_is_bloblike(mp_type)) {
+	if (!mem_is_num(argv[0]) && !mem_is_str(argv[0])) {
 		diag_set(ClientError, ER_SQL_TYPE_MISMATCH,
-			 sql_value_to_diag_str(argv[0]), "numeric");
+			 mem_str(argv[0]), "number");
 		context->is_aborted = true;
 		return;
 	}
-	r = sql_value_double(argv[0]);
+	r = mem_get_double_unsafe(argv[0]);
 	/* If Y==0 and X will fit in a 64-bit int,
 	 * handle the rounding directly,
 	 * otherwise use printf.
@@ -906,20 +647,20 @@ case_type##ICUFunc(sql_context *context, int argc, sql_value **argv)   \
 	const char *z2;                                                        \
 	int n;                                                                 \
 	UNUSED_PARAMETER(argc);                                                \
-	int arg_type = sql_value_type(argv[0]);                                \
-	if (mp_type_is_bloblike(arg_type)) {                                   \
-		diag_set(ClientError, ER_INCONSISTENT_TYPES, "text",           \
-			 "varbinary");                                         \
+	if (mem_is_bin(argv[0]) || mem_is_map(argv[0]) ||                      \
+	    mem_is_array(argv[0])) {                                           \
+		diag_set(ClientError, ER_INCONSISTENT_TYPES, "string",         \
+			 mem_str(argv[0]));                                    \
 		context->is_aborted = true;                                    \
 		return;                                                        \
 	}                                                                      \
-	z2 = (char *)sql_value_text(argv[0]);                              \
-	n = sql_value_bytes(argv[0]);                                      \
+	z2 = mem_as_str0(argv[0]);                                             \
+	n = mem_len_unsafe(argv[0]);                                           \
 	/*                                                                     \
 	 * Verify that the call to _bytes()                                    \
 	 * does not invalidate the _text() pointer.                            \
 	 */                                                                    \
-	assert(z2 == (char *)sql_value_text(argv[0]));                     \
+	assert(z2 == mem_as_str0(argv[0]));                                    \
 	if (!z2)                                                               \
 		return;                                                        \
 	z1 = contextMalloc(context, ((i64) n) + 1);                            \
@@ -984,17 +725,18 @@ randomFunc(sql_context * context, int NotUsed, sql_value ** NotUsed2)
 static void
 randomBlob(sql_context * context, int argc, sql_value ** argv)
 {
-	int n;
+	int64_t n;
 	unsigned char *p;
 	assert(argc == 1);
 	UNUSED_PARAMETER(argc);
-	if (mp_type_is_bloblike(sql_value_type(argv[0]))) {
+	if (mem_is_bin(argv[0]) || mem_is_map(argv[0]) ||
+	    mem_is_array(argv[0])) {
 		diag_set(ClientError, ER_SQL_TYPE_MISMATCH,
-			 sql_value_to_diag_str(argv[0]), "numeric");
+			 mem_str(argv[0]), "number");
 		context->is_aborted = true;
 		return;
 	}
-	n = sql_value_int(argv[0]);
+	n = mem_get_int_unsafe(argv[0]);
 	if (n < 1)
 		return;
 	p = contextMalloc(context, n);
@@ -1241,25 +983,23 @@ likeFunc(sql_context *context, int argc, sql_value **argv)
 	if (lhs_type != MP_STR || rhs_type != MP_STR) {
 		if (lhs_type == MP_NIL || rhs_type == MP_NIL)
 			return;
-		char *inconsistent_type = rhs_type != MP_STR ?
-					  mem_type_to_str(argv[0]) :
-					  mem_type_to_str(argv[1]);
-		diag_set(ClientError, ER_INCONSISTENT_TYPES, "text",
-			 inconsistent_type);
+		const char *str = rhs_type != MP_STR ?
+				  mem_str(argv[0]) : mem_str(argv[1]);
+		diag_set(ClientError, ER_INCONSISTENT_TYPES, "string", str);
 		context->is_aborted = true;
 		return;
 	}
-	const char *zB = (const char *) sql_value_text(argv[0]);
-	const char *zA = (const char *) sql_value_text(argv[1]);
-	const char *zB_end = zB + sql_value_bytes(argv[0]);
-	const char *zA_end = zA + sql_value_bytes(argv[1]);
+	const char *zB = mem_as_str0(argv[0]);
+	const char *zA = mem_as_str0(argv[1]);
+	const char *zB_end = zB + mem_len_unsafe(argv[0]);
+	const char *zA_end = zA + mem_len_unsafe(argv[1]);
 
 	/*
 	 * Limit the length of the LIKE pattern to avoid problems
 	 * of deep recursion and N*N behavior in
 	 * sql_utf8_pattern_compare().
 	 */
-	nPat = sql_value_bytes(argv[0]);
+	nPat = mem_len_unsafe(argv[0]);
 	testcase(nPat == db->aLimit[SQL_LIMIT_LIKE_PATTERN_LENGTH]);
 	testcase(nPat == db->aLimit[SQL_LIMIT_LIKE_PATTERN_LENGTH] + 1);
 	if (nPat > db->aLimit[SQL_LIMIT_LIKE_PATTERN_LENGTH]) {
@@ -1269,7 +1009,7 @@ likeFunc(sql_context *context, int argc, sql_value **argv)
 		return;
 	}
 	/* Encoding did not change */
-	assert(zB == (const char *) sql_value_text(argv[0]));
+	assert(zB == mem_as_str0(argv[0]));
 
 	if (argc == 3) {
 		/*
@@ -1277,10 +1017,10 @@ likeFunc(sql_context *context, int argc, sql_value **argv)
 		 * single UTF-8 character. Otherwise, return an
 		 * error.
 		 */
-		const unsigned char *zEsc = sql_value_text(argv[2]);
+		const unsigned char *zEsc = mem_as_ustr(argv[2]);
 		if (zEsc == 0)
 			return;
-		if (sql_utf8_char_count(zEsc, sql_value_bytes(argv[2])) != 1) {
+		if (sql_utf8_char_count(zEsc, mem_len_unsafe(argv[2])) != 1) {
 			diag_set(ClientError, ER_SQL_EXECUTE, "ESCAPE "\
 				 "expression must be a single character");
 			context->is_aborted = true;
@@ -1359,7 +1099,7 @@ quoteFunc(sql_context * context, int argc, sql_value ** argv)
 	case MP_DOUBLE:{
 			double r1, r2;
 			char zBuf[50];
-			r1 = sql_value_double(argv[0]);
+			r1 = mem_get_double_unsafe(argv[0]);
 			sql_snprintf(sizeof(zBuf), zBuf, "%!.15g", r1);
 			sqlAtoF(zBuf, &r2, 20);
 			if (r1 != r2) {
@@ -1379,9 +1119,9 @@ quoteFunc(sql_context * context, int argc, sql_value ** argv)
 	case MP_ARRAY:
 	case MP_MAP: {
 			char *zText = 0;
-			char const *zBlob = sql_value_blob(argv[0]);
-			int nBlob = sql_value_bytes(argv[0]);
-			assert(zBlob == sql_value_blob(argv[0]));	/* No encoding change */
+			char const *zBlob = mem_as_bin(argv[0]);
+			int nBlob = mem_len_unsafe(argv[0]);
+			assert(zBlob == mem_as_bin(argv[0]));	/* No encoding change */
 			zText =
 			    (char *)contextMalloc(context,
 						  (2 * (i64) nBlob) + 4);
@@ -1406,7 +1146,7 @@ quoteFunc(sql_context * context, int argc, sql_value ** argv)
 	case MP_STR:{
 			int i, j;
 			u64 n;
-			const unsigned char *zArg = sql_value_text(argv[0]);
+			const unsigned char *zArg = mem_as_ustr(argv[0]);
 			char *z;
 
 			if (zArg == 0)
@@ -1433,12 +1173,12 @@ quoteFunc(sql_context * context, int argc, sql_value ** argv)
 		}
 	case MP_BOOL: {
 		sql_result_text(context,
-				SQL_TOKEN_BOOLEAN(sql_value_boolean(argv[0])),
+				SQL_TOKEN_BOOLEAN(mem_get_bool_unsafe(argv[0])),
 				-1, SQL_TRANSIENT);
 		break;
 	}
 	default:{
-			assert(sql_value_is_null(argv[0]));
+			assert(mem_is_null(argv[0]));
 			sql_result_text(context, "NULL", 4, SQL_STATIC);
 			break;
 		}
@@ -1452,7 +1192,7 @@ quoteFunc(sql_context * context, int argc, sql_value ** argv)
 static void
 unicodeFunc(sql_context * context, int argc, sql_value ** argv)
 {
-	const unsigned char *z = sql_value_text(argv[0]);
+	const unsigned char *z = mem_as_ustr(argv[0]);
 	(void)argc;
 	if (z && z[0])
 		sql_result_uint(context, sqlUtf8Read(&z));
@@ -1479,7 +1219,7 @@ charFunc(sql_context * context, int argc, sql_value ** argv)
 		if (sql_value_type(argv[i]) == MP_INT)
 			x = 0xfffd;
 		else
-			x = sql_value_uint64(argv[i]);
+			x = mem_get_uint_unsafe(argv[i]);
 		if (x > 0x10ffff)
 			x = 0xfffd;
 		c = (unsigned)(x & 0x1fffff);
@@ -1514,9 +1254,9 @@ hexFunc(sql_context * context, int argc, sql_value ** argv)
 	char *zHex, *z;
 	assert(argc == 1);
 	UNUSED_PARAMETER(argc);
-	pBlob = sql_value_blob(argv[0]);
-	n = sql_value_bytes(argv[0]);
-	assert(pBlob == sql_value_blob(argv[0]));	/* No encoding change */
+	pBlob = mem_as_bin(argv[0]);
+	n = mem_len_unsafe(argv[0]);
+	assert(pBlob == mem_as_bin(argv[0]));	/* No encoding change */
 	z = zHex = contextMalloc(context, ((i64) n) * 2 + 1);
 	if (zHex) {
 		for (i = 0; i < n; i++, pBlob++) {
@@ -1535,10 +1275,10 @@ hexFunc(sql_context * context, int argc, sql_value ** argv)
 static void
 zeroblobFunc(sql_context * context, int argc, sql_value ** argv)
 {
-	i64 n;
+	int64_t n;
 	assert(argc == 1);
 	UNUSED_PARAMETER(argc);
-	n = sql_value_int64(argv[0]);
+	n = mem_get_int_unsafe(argv[0]);
 	if (n < 0)
 		n = 0;
 	if (sql_result_zeroblob64(context, n) != 0) {
@@ -1570,29 +1310,29 @@ replaceFunc(sql_context * context, int argc, sql_value ** argv)
 
 	assert(argc == 3);
 	UNUSED_PARAMETER(argc);
-	zStr = sql_value_text(argv[0]);
+	zStr = mem_as_ustr(argv[0]);
 	if (zStr == 0)
 		return;
-	nStr = sql_value_bytes(argv[0]);
-	assert(zStr == sql_value_text(argv[0]));	/* No encoding change */
-	zPattern = sql_value_text(argv[1]);
+	nStr = mem_len_unsafe(argv[0]);
+	assert(zStr == mem_as_ustr(argv[0]));	/* No encoding change */
+	zPattern = mem_as_ustr(argv[1]);
 	if (zPattern == 0) {
-		assert(sql_value_is_null(argv[1])
+		assert(mem_is_null(argv[1])
 		       || sql_context_db_handle(context)->mallocFailed);
 		return;
 	}
-	nPattern = sql_value_bytes(argv[1]);
+	nPattern = mem_len_unsafe(argv[1]);
 	if (nPattern == 0) {
-		assert(! sql_value_is_null(argv[1]));
+		assert(!mem_is_null(argv[1]));
 		sql_result_value(context, argv[0]);
 		return;
 	}
-	assert(zPattern == sql_value_text(argv[1]));	/* No encoding change */
-	zRep = sql_value_text(argv[2]);
+	assert(zPattern == mem_as_ustr(argv[1]));	/* No encoding change */
+	zRep = mem_as_ustr(argv[2]);
 	if (zRep == 0)
 		return;
-	nRep = sql_value_bytes(argv[2]);
-	assert(zRep == sql_value_text(argv[2]));
+	nRep = mem_len_unsafe(argv[2]);
+	assert(zRep == mem_as_ustr(argv[2]));
 	nOut = nStr + 1;
 	assert(nOut < SQL_MAX_LENGTH);
 	zOut = contextMalloc(context, (i64) nOut);
@@ -1747,15 +1487,14 @@ trim_func_one_arg(struct sql_context *context, sql_value *arg)
 {
 	/* In case of VARBINARY type default trim octet is X'00'. */
 	const unsigned char *default_trim;
-	enum mp_type val_type = sql_value_type(arg);
-	if (val_type == MP_NIL)
+	if (mem_is_null(arg))
 		return;
-	if (mp_type_is_bloblike(val_type))
+	if (mem_is_bin(arg))
 		default_trim = (const unsigned char *) "\0";
 	else
 		default_trim = (const unsigned char *) " ";
-	int input_str_sz = sql_value_bytes(arg);
-	const unsigned char *input_str = sql_value_text(arg);
+	const unsigned char *input_str = mem_as_ustr(arg);
+	int input_str_sz = mem_len_unsafe(arg);
 	uint8_t trim_char_len[1] = { 1 };
 	trim_procedure(context, TRIM_BOTH, default_trim, trim_char_len, 1,
 		       input_str, input_str_sz);
@@ -1777,17 +1516,17 @@ trim_func_two_args(struct sql_context *context, sql_value *arg1,
 		   sql_value *arg2)
 {
 	const unsigned char *input_str, *trim_set;
-	if ((input_str = sql_value_text(arg2)) == NULL)
+	if ((input_str = mem_as_ustr(arg2)) == NULL)
 		return;
 
-	int input_str_sz = sql_value_bytes(arg2);
+	int input_str_sz = mem_len_unsafe(arg2);
 	if (sql_value_type(arg1) == MP_INT || sql_value_type(arg1) == MP_UINT) {
 		uint8_t len_one = 1;
-		trim_procedure(context, sql_value_int(arg1),
+		trim_procedure(context, mem_get_int_unsafe(arg1),
 			       (const unsigned char *) " ", &len_one, 1,
 			       input_str, input_str_sz);
-	} else if ((trim_set = sql_value_text(arg1)) != NULL) {
-		int trim_set_sz = sql_value_bytes(arg1);
+	} else if ((trim_set = mem_as_ustr(arg1)) != NULL) {
+		int trim_set_sz = mem_len_unsafe(arg1);
 		uint8_t *char_len;
 		int char_cnt = trim_prepare_char_len(context, trim_set,
 						     trim_set_sz, &char_len);
@@ -1812,18 +1551,18 @@ trim_func_three_args(struct sql_context *context, sql_value *arg1,
 {
 	assert(sql_value_type(arg1) == MP_INT || sql_value_type(arg1) == MP_UINT);
 	const unsigned char *input_str, *trim_set;
-	if ((input_str = sql_value_text(arg3)) == NULL ||
-	    (trim_set = sql_value_text(arg2)) == NULL)
+	if ((input_str = mem_as_ustr(arg3)) == NULL ||
+	    (trim_set = mem_as_ustr(arg2)) == NULL)
 		return;
 
-	int trim_set_sz = sql_value_bytes(arg2);
-	int input_str_sz = sql_value_bytes(arg3);
+	int trim_set_sz = mem_len_unsafe(arg2);
+	int input_str_sz = mem_len_unsafe(arg3);
 	uint8_t *char_len;
 	int char_cnt = trim_prepare_char_len(context, trim_set, trim_set_sz,
 					     &char_len);
 	if (char_cnt == -1)
 		return;
-	trim_procedure(context, sql_value_int(arg1), trim_set, char_len,
+	trim_procedure(context, mem_get_int_unsafe(arg1), trim_set, char_len,
 		       char_cnt, input_str, input_str_sz);
 	sql_free(char_len);
 }
@@ -1879,14 +1618,14 @@ soundexFunc(sql_context * context, int argc, sql_value ** argv)
 		1, 2, 6, 2, 3, 0, 1, 0, 2, 0, 2, 0, 0, 0, 0, 0,
 	};
 	assert(argc == 1);
-	enum mp_type mp_type = sql_value_type(argv[0]);
-	if (mp_type_is_bloblike(mp_type)) {
+	if (mem_is_bin(argv[0]) || mem_is_map(argv[0]) ||
+	    mem_is_array(argv[0])) {
 		diag_set(ClientError, ER_SQL_TYPE_MISMATCH,
-			 sql_value_to_diag_str(argv[0]), "text");
+			 mem_str(argv[0]), "string");
 		context->is_aborted = true;
 		return;
 	}
-	zIn = (u8 *) sql_value_text(argv[0]);
+	zIn = (u8 *) mem_as_ustr(argv[0]);
 	if (zIn == 0)
 		zIn = (u8 *) "";
 	for (i = 0; zIn[i] && !sqlIsalpha(zIn[i]); i++) {
@@ -1953,9 +1692,9 @@ sum_step(struct sql_context *context, int argc, sql_value **argv)
 	if (type == MP_NIL || p == NULL)
 		return;
 	if (type != MP_DOUBLE && type != MP_INT && type != MP_UINT) {
-		if (mem_apply_numeric_type(argv[0]) != 0) {
+		if (type != MP_STR || mem_to_number(argv[0]) != 0) {
 			diag_set(ClientError, ER_SQL_TYPE_MISMATCH,
-				 sql_value_to_diag_str(argv[0]), "number");
+				 mem_str(argv[0]), "number");
 			context->is_aborted = true;
 			return;
 		}
@@ -1963,7 +1702,7 @@ sum_step(struct sql_context *context, int argc, sql_value **argv)
 	}
 	p->cnt++;
 	if (type == MP_INT || type == MP_UINT) {
-		int64_t v = sql_value_int64(argv[0]);
+		int64_t v = mem_get_int_unsafe(argv[0]);
 		if (type == MP_INT)
 			p->rSum += v;
 		else
@@ -1974,7 +1713,7 @@ sum_step(struct sql_context *context, int argc, sql_value **argv)
 			p->overflow = 1;
 		}
 	} else {
-		p->rSum += sql_value_double(argv[0]);
+		p->rSum += mem_get_double_unsafe(argv[0]);
 		p->approx = 1;
 	}
 }
@@ -2038,9 +1777,8 @@ countStep(sql_context * context, int argc, sql_value ** argv)
 		return;
 	}
 	p = sql_aggregate_context(context, sizeof(*p));
-	if ((argc == 0 || ! sql_value_is_null(argv[0])) && p) {
+	if ((argc == 0 || !mem_is_null(argv[0])) && p != NULL)
 		p->n++;
-	}
 }
 
 static void
@@ -2063,14 +1801,14 @@ minmaxStep(sql_context * context, int NotUsed, sql_value ** argv)
 
 	struct func_sql_builtin *func =
 		(struct func_sql_builtin *)context->func;
-	pBest = (Mem *) sql_aggregate_context(context, sizeof(*pBest));
+	pBest = sql_context_agg_mem(context);
 	if (!pBest)
 		return;
 
-	if (sql_value_is_null(argv[0])) {
-		if (pBest->flags)
+	if (mem_is_null(argv[0])) {
+		if (!mem_is_null(pBest))
 			sqlSkipAccumulatorLoad(context);
-	} else if (pBest->flags) {
+	} else if (!mem_is_null(pBest)) {
 		int cmp;
 		struct coll *pColl = sqlGetFuncCollSeq(context);
 		/*
@@ -2082,27 +1820,26 @@ minmaxStep(sql_context * context, int NotUsed, sql_value ** argv)
 		bool is_max = (func->flags & SQL_FUNC_MAX) != 0;
 		cmp = sqlMemCompare(pBest, pArg, pColl);
 		if ((is_max && cmp < 0) || (!is_max && cmp > 0)) {
-			sqlVdbeMemCopy(pBest, pArg);
+			mem_copy(pBest, pArg);
 		} else {
 			sqlSkipAccumulatorLoad(context);
 		}
 	} else {
 		pBest->db = sql_context_db_handle(context);
-		sqlVdbeMemCopy(pBest, pArg);
+		mem_copy(pBest, pArg);
 	}
 }
 
 static void
 minMaxFinalize(sql_context * context)
 {
-	sql_value *pRes;
-	pRes = (sql_value *) sql_aggregate_context(context, 0);
-	if (pRes) {
-		if (pRes->flags) {
-			sql_result_value(context, pRes);
-		}
-		sqlVdbeMemRelease(pRes);
-	}
+	struct Mem *mem = context->pMem;
+	struct Mem *res;
+	if (mem_get_agg(mem, (void **)&res) != 0)
+		return;
+	if (!mem_is_null(res))
+		sql_result_value(context, res);
+	mem_destroy(res);
 }
 
 /*
@@ -2121,7 +1858,7 @@ groupConcatStep(sql_context * context, int argc, sql_value ** argv)
 		context->is_aborted = true;
 		return;
 	}
-	if (sql_value_is_null(argv[0]))
+	if (mem_is_null(argv[0]))
 		return;
 	pAccum =
 	    (StrAccum *) sql_aggregate_context(context, sizeof(*pAccum));
@@ -2132,8 +1869,8 @@ groupConcatStep(sql_context * context, int argc, sql_value ** argv)
 		pAccum->mxAlloc = db->aLimit[SQL_LIMIT_LENGTH];
 		if (!firstTerm) {
 			if (argc == 2) {
-				zSep = (char *)sql_value_text(argv[1]);
-				nSep = sql_value_bytes(argv[1]);
+				zSep = mem_as_str0(argv[1]);
+				nSep = mem_len_unsafe(argv[1]);
 			} else {
 				zSep = ",";
 				nSep = 1;
@@ -2141,8 +1878,8 @@ groupConcatStep(sql_context * context, int argc, sql_value ** argv)
 			if (zSep)
 				sqlStrAccumAppend(pAccum, zSep, nSep);
 		}
-		zVal = (char *)sql_value_text(argv[0]);
-		nVal = sql_value_bytes(argv[0]);
+		zVal = mem_as_str0(argv[0]);
+		nVal = mem_len_unsafe(argv[0]);
 		if (zVal)
 			sqlStrAccumAppend(pAccum, zVal, nVal);
 	}
@@ -2831,6 +2568,16 @@ static struct {
 	 .is_deterministic = true,
 	 .flags = SQL_FUNC_DERIVEDCOLL | SQL_FUNC_NEEDCOLL,
 	 .call = UpperICUFunc,
+	 .finalize = NULL,
+	 .export_to_sql = true,
+	}, {
+	 .name = "UUID",
+	 .param_count = -1,
+	 .returns = FIELD_TYPE_UUID,
+	 .aggregate = FUNC_AGGREGATE_NONE,
+	 .is_deterministic = false,
+	 .flags = 0,
+	 .call = sql_func_uuid,
 	 .finalize = NULL,
 	 .export_to_sql = true,
 	}, {

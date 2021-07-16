@@ -35,6 +35,7 @@
  * VDBE.
  */
 #include "sqlInt.h"
+#include "mem.h"
 #include "vdbeInt.h"
 #include "box/session.h"
 
@@ -100,165 +101,18 @@ sql_stmt_reset(sql_stmt *pStmt)
 	return rc;
 }
 
-/*
- * Set all the parameters in the compiled SQL statement to NULL.
- */
-int
-sql_clear_bindings(sql_stmt * pStmt)
-{
-	int i;
-	int rc = 0;
-	Vdbe *p = (Vdbe *) pStmt;
-	for (i = 0; i < p->nVar; i++) {
-		sqlVdbeMemRelease(&p->aVar[i]);
-		p->aVar[i].flags = MEM_Null;
-	}
-	return rc;
-}
-
 bool
 sql_metadata_is_full()
 {
 	return current_session()->sql_flags & SQL_FullMetadata;
 }
 
-/**************************** sql_value_  ******************************
- * The following routines extract information from a Mem or sql_value
- * structure.
- */
-const void *
-sql_value_blob(sql_value * pVal)
-{
-	Mem *p = (Mem *) pVal;
-	if (p->flags & (MEM_Blob | MEM_Str)) {
-		if (ExpandBlob(p) != 0) {
-			assert(p->flags == MEM_Null && p->z == 0);
-			return 0;
-		}
-		p->flags |= MEM_Blob;
-		return p->n ? p->z : 0;
-	} else {
-		return sql_value_text(pVal);
-	}
-}
-
-int
-sql_value_bytes(sql_value * pVal)
-{
-	return sqlValueBytes(pVal);
-}
-
-double
-sql_value_double(sql_value * pVal)
-{
-	double v = 0.0;
-	sqlVdbeRealValue((Mem *) pVal, &v);
-	return v;
-}
-
-bool
-sql_value_boolean(sql_value *val)
-{
-	bool b = false;
-	int rc = mem_value_bool((struct Mem *) val, &b);
-	assert(rc == 0);
-	(void) rc;
-	return b;
-}
-
-int
-sql_value_int(sql_value * pVal)
-{
-	int64_t i = 0;
-	bool is_neg;
-	sqlVdbeIntValue((Mem *) pVal, &i, &is_neg);
-	return (int)i;
-}
-
-sql_int64
-sql_value_int64(sql_value * pVal)
-{
-	int64_t i = 0;
-	bool unused;
-	sqlVdbeIntValue((Mem *) pVal, &i, &unused);
-	return i;
-}
-
-uint64_t
-sql_value_uint64(sql_value *val)
-{
-	int64_t i = 0;
-	bool is_neg;
-	sqlVdbeIntValue((struct Mem *) val, &i, &is_neg);
-	assert(!is_neg);
-	return i;
-}
-
-enum sql_subtype
-sql_value_subtype(sql_value * pVal)
-{
-	return (pVal->flags & MEM_Subtype) != 0 ? pVal->subtype : SQL_SUBTYPE_NO;
-}
-
-const unsigned char *
-sql_value_text(sql_value * pVal)
-{
-	return (const unsigned char *)sqlValueText(pVal);
-}
-
-/* EVIDENCE-OF: R-12793-43283 Every value in sql has one of five
- * fundamental datatypes: 64-bit signed integer 64-bit IEEE floating
- * point number string BLOB NULL
- */
-enum mp_type
-sql_value_type(sql_value *pVal)
-{
-	struct Mem *mem = (struct Mem *) pVal;
-	return mem_mp_type(mem);
-}
-
-/* Make a copy of an sql_value object
- */
-sql_value *
-sql_value_dup(const sql_value * pOrig)
-{
-	sql_value *pNew;
-	if (pOrig == 0)
-		return 0;
-	pNew = sql_malloc(sizeof(*pNew));
-	if (pNew == 0)
-		return 0;
-	memset(pNew, 0, sizeof(*pNew));
-	memcpy(pNew, pOrig, MEMCELLSIZE);
-	pNew->flags &= ~MEM_Dyn;
-	pNew->db = 0;
-	if (pNew->flags & (MEM_Str | MEM_Blob)) {
-		pNew->flags &= ~(MEM_Static | MEM_Dyn);
-		pNew->flags |= MEM_Ephem;
-		if (sqlVdbeMemMakeWriteable(pNew) != 0) {
-			sqlValueFree(pNew);
-			pNew = 0;
-		}
-	}
-	return pNew;
-}
-
-/* Destroy an sql_value object previously obtained from
- * sql_value_dup().
- */
-void
-sql_value_free(sql_value * pOld)
-{
-	sqlValueFree(pOld);
-}
-
 /**************************** sql_result_  ******************************
  * The following routines are used by user-defined functions to specify
  * the function result.
  *
- * The setStrOrError() function calls sqlVdbeMemSetStr() to store the
- * result as a string or blob but if the string or blob is too large, it
- * then sets the error code.
+ * The setStrOrError() function sets the result as a string or blob but
+ * if the string or blob is too large, it then sets the error code.
  *
  * The invokeValueDestructor(P,X) routine invokes destructor function X()
  * on value P is not going to be used and need to be destroyed.
@@ -270,7 +124,9 @@ setResultStrOrError(sql_context * pCtx,	/* Function context */
 		    void (*xDel) (void *)	/* Destructor function */
     )
 {
-	if (sqlVdbeMemSetStr(pCtx->pOut, z, n, 1, xDel) != 0)
+	if (xDel != SQL_TRANSIENT)
+		return mem_set_strl(pCtx->pOut, (char *)z, n, xDel);
+	if (mem_copy_strl(pCtx->pOut, z, n) != 0)
 		pCtx->is_aborted = true;
 }
 
@@ -302,7 +158,9 @@ sql_result_blob(sql_context * pCtx,
     )
 {
 	assert(n >= 0);
-	if (sqlVdbeMemSetStr(pCtx->pOut, z, n, 0, xDel) != 0)
+	if (xDel != SQL_TRANSIENT)
+		mem_set_binl(pCtx->pOut, (char *)z, n, xDel);
+	else if (mem_copy_bin(pCtx->pOut, z, n) != 0)
 		pCtx->is_aborted = true;
 }
 
@@ -328,13 +186,13 @@ sql_result_double(sql_context * pCtx, double rVal)
 void
 sql_result_uint(sql_context *ctx, uint64_t u_val)
 {
-	mem_set_u64(ctx->pOut, u_val);
+	mem_set_uint(ctx->pOut, u_val);
 }
 
 void
 sql_result_int(sql_context *ctx, int64_t val)
 {
-	mem_set_i64(ctx->pOut, val);
+	mem_set_int(ctx->pOut, val, val < 0);
 }
 
 void
@@ -346,7 +204,7 @@ sql_result_bool(struct sql_context *ctx, bool value)
 void
 sql_result_null(sql_context * pCtx)
 {
-	sqlVdbeMemSetNull(pCtx->pOut);
+	mem_set_null(pCtx->pOut);
 }
 
 void
@@ -374,13 +232,13 @@ sql_result_text64(sql_context * pCtx,
 void
 sql_result_value(sql_context * pCtx, sql_value * pValue)
 {
-	sqlVdbeMemCopy(pCtx->pOut, pValue);
+	mem_copy(pCtx->pOut, pValue);
 }
 
 void
 sql_result_zeroblob(sql_context * pCtx, int n)
 {
-	sqlVdbeMemSetZeroBlob(pCtx->pOut, n);
+	mem_set_zerobin(pCtx->pOut, n);
 }
 
 int
@@ -392,7 +250,7 @@ sql_result_zeroblob64(sql_context * pCtx, u64 n)
 			 "is too big");
 		return -1;
 	}
-	sqlVdbeMemSetZeroBlob(pCtx->pOut, (int)n);
+	mem_set_zerobin(pCtx->pOut, (int)n);
 	return 0;
 }
 
@@ -518,29 +376,6 @@ sqlStmtCurrentTime(sql_context * p)
 }
 
 /*
- * Create a new aggregate context for p and return a pointer to
- * its pMem->z element.
- */
-static SQL_NOINLINE void *
-createAggContext(sql_context * p, int nByte)
-{
-	Mem *pMem = p->pMem;
-	assert((pMem->flags & MEM_Agg) == 0);
-	if (nByte <= 0) {
-		sqlVdbeMemSetNull(pMem);
-		pMem->z = 0;
-	} else {
-		sqlVdbeMemClearAndResize(pMem, nByte);
-		pMem->flags = MEM_Agg;
-		pMem->u.func = p->func;
-		if (pMem->z) {
-			memset(pMem->z, 0, nByte);
-		}
-	}
-	return (void *)pMem->z;
-}
-
-/*
  * Allocate or return the aggregate context for a user function.  A new
  * context is allocated on the first call.  Subsequent calls return the
  * same context that was returned on prior calls.
@@ -551,12 +386,32 @@ sql_aggregate_context(sql_context * p, int nByte)
 	assert(p != NULL && p->func != NULL);
 	assert(p->func->def->language == FUNC_LANGUAGE_SQL_BUILTIN);
 	assert(p->func->def->aggregate == FUNC_AGGREGATE_GROUP);
-	testcase(nByte < 0);
-	if ((p->pMem->flags & MEM_Agg) == 0) {
-		return createAggContext(p, nByte);
-	} else {
-		return (void *)p->pMem->z;
+	if (!mem_is_agg(p->pMem) && mem_set_agg(p->pMem, p->func, nByte) != 0)
+		return NULL;
+	void *accum;
+	if (mem_get_agg(p->pMem, &accum) != 0)
+		return NULL;
+	return accum;
+}
+
+struct Mem *
+sql_context_agg_mem(struct sql_context *ctx)
+{
+	assert(ctx != NULL && ctx->func != NULL);
+	assert(ctx->func->def->language == FUNC_LANGUAGE_SQL_BUILTIN);
+	assert(ctx->func->def->aggregate == FUNC_AGGREGATE_GROUP);
+	struct Mem *mem;
+	if (!mem_is_agg(ctx->pMem)) {
+		if (mem_set_agg(ctx->pMem, ctx->func, sizeof(*mem)) != 0)
+			return NULL;
+		if (mem_get_agg(ctx->pMem, (void **)&mem) != 0)
+			return NULL;
+		mem_create(mem);
+		return mem;
 	}
+	if (mem_get_agg(ctx->pMem, (void **)&mem) != 0)
+		return NULL;
+	return mem;
 }
 
 /*
@@ -582,146 +437,13 @@ sql_data_count(sql_stmt * pStmt)
 	return pVm->nResColumn;
 }
 
-/*
- * Return a pointer to static memory containing an SQL NULL value.
- */
-static const Mem *
-columnNullValue(void)
+char *
+sql_stmt_result_to_msgpack(struct sql_stmt *stmt, uint32_t *tuple_size,
+			   struct region *region)
 {
-	/* Even though the Mem structure contains an element
-	 * of type i64, on certain architectures (x86) with certain compiler
-	 * switches (-Os), gcc may align this Mem object on a 4-byte boundary
-	 * instead of an 8-byte one. This all works fine, except that when
-	 * running with SQL_DEBUG defined the sql code sometimes assert()s
-	 * that a Mem structure is located on an 8-byte boundary. To prevent
-	 * these assert()s from failing, when building with SQL_DEBUG defined
-	 * using gcc, we force nullMem to be 8-byte aligned using the magical
-	 * __attribute__((aligned(8))) macro.
-	 */
-	static const Mem nullMem
-#if defined(SQL_DEBUG) && defined(__GNUC__)
-	    __attribute__ ((aligned(8)))
-#endif
-	    = {
-		/* .u          = */  {
-		0},
-		    /* .flags      = */ (u16) MEM_Null,
-		    /* .eSubtype   = */ (u8) 0,
-		    /* .field_type = */ field_type_MAX,
-		    /* .n          = */ (int)0,
-		    /* .z          = */ (char *)0,
-		    /* .zMalloc    = */ (char *)0,
-		    /* .szMalloc   = */ (int)0,
-		    /* .uTemp      = */ (u32) 0,
-		    /* .db         = */ (sql *) 0,
-		    /* .xDel       = */ (void (*)(void *))0,
-#ifdef SQL_DEBUG
-		    /* .pScopyFrom = */ (Mem *) 0,
-		    /* .pFiller    = */ (void *)0,
-#endif
-	};
-	return &nullMem;
-}
-
-/*
- * Check to see if column iCol of the given statement is valid.  If
- * it is, return a pointer to the Mem for the value of that column.
- * If iCol is not valid, return a pointer to a Mem which has a value
- * of NULL.
- */
-static Mem *
-columnMem(sql_stmt * pStmt, int i)
-{
-	Vdbe *pVm;
-	Mem *pOut;
-
-	pVm = (Vdbe *) pStmt;
-	if (pVm == 0)
-		return (Mem *) columnNullValue();
-	assert(pVm->db);
-	if (pVm->pResultSet != 0 && i < pVm->nResColumn && i >= 0) {
-		pOut = &pVm->pResultSet[i];
-	} else {
-		pOut = (Mem *) columnNullValue();
-	}
-	return pOut;
-}
-
-/**************************** sql_column_  ******************************
- * The following routines are used to access elements of the current row
- * in the result set.
- */
-const void *
-sql_column_blob(sql_stmt * pStmt, int i)
-{
-	const void *val;
-	val = sql_value_blob(columnMem(pStmt, i));
-	return val;
-}
-
-int
-sql_column_bytes(sql_stmt * pStmt, int i)
-{
-	return sql_value_bytes(columnMem(pStmt, i));
-}
-
-double
-sql_column_double(sql_stmt * pStmt, int i)
-{
-	return sql_value_double(columnMem(pStmt, i));
-}
-
-int
-sql_column_int(sql_stmt * pStmt, int i)
-{
-	return sql_value_int(columnMem(pStmt, i));
-}
-
-bool
-sql_column_boolean(struct sql_stmt *stmt, int i)
-{
-	return sql_value_boolean(columnMem(stmt, i));
-}
-
-sql_int64
-sql_column_int64(sql_stmt * pStmt, int i)
-{
-	return sql_value_int64(columnMem(pStmt, i));
-}
-
-uint64_t
-sql_column_uint64(sql_stmt * pStmt, int i)
-{
-	return sql_value_uint64(columnMem(pStmt, i));
-}
-
-const unsigned char *
-sql_column_text(sql_stmt * pStmt, int i)
-{
-	return sql_value_text(columnMem(pStmt, i));
-}
-
-sql_value *
-sql_column_value(sql_stmt * pStmt, int i)
-{
-	Mem *pOut = columnMem(pStmt, i);
-	if (pOut->flags & MEM_Static) {
-		pOut->flags &= ~MEM_Static;
-		pOut->flags |= MEM_Ephem;
-	}
-	return (sql_value *) pOut;
-}
-
-enum mp_type
-sql_column_type(sql_stmt * pStmt, int i)
-{
-	return sql_value_type(columnMem(pStmt, i));
-}
-
-enum sql_subtype
-sql_column_subtype(struct sql_stmt *stmt, int i)
-{
-	return sql_value_subtype(columnMem(stmt, i));
+	struct Vdbe *vdbe = (struct Vdbe *)stmt;
+	return sql_vdbe_mem_encode_tuple(vdbe->pResultSet, vdbe->nResColumn,
+					 tuple_size, region);
 }
 
 /*
@@ -878,9 +600,7 @@ vdbeUnbind(Vdbe * p, int i)
 	}
 	i--;
 	pVar = &p->aVar[i];
-	sqlVdbeMemRelease(pVar);
-	pVar->flags = MEM_Null;
-	pVar->field_type = field_type_MAX;
+	mem_destroy(pVar);
 	return 0;
 }
 
@@ -964,7 +684,9 @@ bindText(sql_stmt * pStmt,	/* The statement to bind against */
 	if (zData == NULL)
 		return 0;
 	pVar = &p->aVar[i - 1];
-	if (sqlVdbeMemSetStr(pVar, zData, nData, 1, xDel) != 0)
+	if (xDel != SQL_TRANSIENT)
+		mem_set_strl(pVar, (char *)zData, nData, xDel);
+	else if (mem_copy_strl(pVar, zData, nData) != 0)
 		return -1;
 	return sql_bind_type(p, i, "text");
 }
@@ -986,7 +708,9 @@ sql_bind_blob(sql_stmt * pStmt,
 	if (zData == NULL)
 		return 0;
 	struct Mem *var = &p->aVar[i - 1];
-	if (sqlVdbeMemSetStr(var, zData, nData, 0, xDel) != 0)
+	if (xDel != SQL_TRANSIENT)
+		mem_set_binl(var, (char *)zData, nData, xDel);
+	else if (mem_copy_bin(var, zData, nData) != 0)
 		return -1;
 	return sql_bind_type(p, i, "varbinary");
 }
@@ -1053,7 +777,7 @@ sql_bind_uint64(struct sql_stmt *stmt, int i, uint64_t value)
 	if (vdbeUnbind(p, i) != 0)
 		return -1;
 	int rc = sql_bind_type(p, i, "integer");
-	mem_set_u64(&p->aVar[i - 1], value);
+	mem_set_uint(&p->aVar[i - 1], value);
 	return rc;
 }
 
@@ -1079,14 +803,6 @@ sql_bind_ptr(struct sql_stmt *stmt, int i, void *ptr)
 }
 
 int
-sql_bind_text(sql_stmt * pStmt,
-		  int i, const char *zData, int nData, void (*xDel) (void *)
-    )
-{
-	return bindText(pStmt, i, zData, nData, xDel);
-}
-
-int
 sql_bind_text64(sql_stmt * pStmt,
 		    int i,
 		    const char *zData,
@@ -1107,7 +823,7 @@ sql_bind_zeroblob(sql_stmt * pStmt, int i, int n)
 	Vdbe *p = (Vdbe *) pStmt;
 	if (vdbeUnbind(p, i) != 0)
 		return -1;
-	sqlVdbeMemSetZeroBlob(&p->aVar[i - 1], n);
+	mem_set_zerobin(&p->aVar[i - 1], n);
 	return 0;
 }
 
@@ -1179,7 +895,7 @@ sqlTransferBindings(sql_stmt * pFromStmt, sql_stmt * pToStmt)
 	assert(pTo->db == pFrom->db);
 	assert(pTo->nVar == pFrom->nVar);
 	for (i = 0; i < pFrom->nVar; i++) {
-		sqlVdbeMemMove(&pTo->aVar[i], &pFrom->aVar[i]);
+		mem_move(&pTo->aVar[i], &pFrom->aVar[i]);
 	}
 	return 0;
 }

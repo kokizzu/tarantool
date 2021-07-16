@@ -205,9 +205,9 @@ memtx_engine_recover_snapshot(struct memtx_engine *memtx,
 	 */
 	if (!xlog_cursor_is_eof(&cursor)) {
 		if (!memtx->force_recovery)
-			panic("snapshot `%s' has no EOF marker", filename);
+			panic("snapshot `%s' has no EOF marker", cursor.name);
 		else
-			say_error("snapshot `%s' has no EOF marker", filename);
+			say_error("snapshot `%s' has no EOF marker", cursor.name);
 	}
 
 	return 0;
@@ -253,7 +253,7 @@ memtx_engine_recover_snapshot_row(struct memtx_engine *memtx,
 	struct txn *txn = txn_begin();
 	if (txn == NULL)
 		return -1;
-	if (txn_begin_stmt(txn, space) != 0)
+	if (txn_begin_stmt(txn, space, request.type) != 0)
 		goto rollback;
 	/* no access checks here - applier always works with admin privs */
 	struct tuple *unused;
@@ -265,7 +265,7 @@ memtx_engine_recover_snapshot_row(struct memtx_engine *memtx,
 	 * Snapshot rows are confirmed by definition. They don't need to go to
 	 * the synchronous transactions limbo.
 	 */
-	txn_set_flag(txn, TXN_FORCE_ASYNC);
+	txn_set_flags(txn, TXN_FORCE_ASYNC);
 	rc = txn_commit(txn);
 	/*
 	 * Don't let gc pool grow too much. Yet to
@@ -277,7 +277,7 @@ memtx_engine_recover_snapshot_row(struct memtx_engine *memtx,
 rollback_stmt:
 	txn_rollback_stmt(txn);
 rollback:
-	txn_rollback(txn);
+	txn_abort(txn);
 	fiber_gc();
 	return -1;
 }
@@ -315,7 +315,7 @@ memtx_engine_begin_final_recovery(struct engine *engine)
 	/* End of the fast path: loaded the primary key. */
 	space_foreach(memtx_end_build_primary_key, memtx);
 
-	if (!memtx->force_recovery) {
+	if (!memtx->force_recovery && !memtx_tx_manager_use_mvcc_engine) {
 		/*
 		 * Fast start path: "play out" WAL
 		 * records using the primary key only,
@@ -409,6 +409,10 @@ memtx_engine_rollback_statement(struct engine *engine, struct txn *txn,
 	if (stmt->old_tuple == NULL && stmt->new_tuple == NULL)
 		return;
 	struct space *space = stmt->space;
+	if (space == NULL) {
+		/* The space was deleted. Nothing to rollback. */
+		return;
+	}
 	struct memtx_space *memtx_space = (struct memtx_space *)space;
 	uint32_t index_count;
 
@@ -431,7 +435,7 @@ memtx_engine_rollback_statement(struct engine *engine, struct txn *txn,
 		struct index *index = space->index[i];
 		/* Rollback must not fail. */
 		if (index_replace(index, stmt->new_tuple, stmt->old_tuple,
-				  DUP_INSERT, &unused) != 0) {
+				  DUP_INSERT, &unused, &unused) != 0) {
 			diag_log();
 			unreachable();
 			panic("failed to rollback change");
@@ -759,6 +763,7 @@ static void
 memtx_engine_commit_checkpoint(struct engine *engine,
 			       const struct vclock *vclock)
 {
+	ERROR_INJECT_TERMINATE(ERRINJ_SNAP_COMMIT_FAIL);
 	(void) vclock;
 	struct memtx_engine *memtx = (struct memtx_engine *)engine;
 
@@ -955,6 +960,7 @@ memtx_engine_join(struct engine *engine, void *arg, struct xstream *stream)
 	memtx->replica_join_cord = &cord;
 	int res = cord_cojoin(&cord);
 	memtx->replica_join_cord = NULL;
+	xstream_reset(stream);
 	return res;
 }
 
@@ -1064,7 +1070,7 @@ memtx_engine_gc_f(va_list va)
 struct memtx_engine *
 memtx_engine_new(const char *snap_dirname, bool force_recovery,
 		 uint64_t tuple_arena_max_size, uint32_t objsize_min,
-		 bool dontdump, float alloc_factor)
+		 bool dontdump, unsigned granularity, float alloc_factor)
 {
 	struct memtx_engine *memtx = calloc(1, sizeof(*memtx));
 	if (memtx == NULL) {
@@ -1133,7 +1139,8 @@ memtx_engine_new(const char *snap_dirname, bool force_recovery,
 	slab_cache_create(&memtx->slab_cache, &memtx->arena);
 	float actual_alloc_factor;
 	small_alloc_create(&memtx->alloc, &memtx->slab_cache,
-			   objsize_min, alloc_factor, &actual_alloc_factor);
+			   objsize_min, granularity, alloc_factor,
+			   &actual_alloc_factor);
 	say_info("Actual slab_alloc_factor calculated on the basis of desired "
 		 "slab_alloc_factor = %f", actual_alloc_factor);
 

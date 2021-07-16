@@ -13,16 +13,13 @@ be necessary for building and testing:
   Ordinarily, this is gcc and g++ version 4.6 or later. On Mac OS X, this
   is Clang version 3.2+.
 * cmake
-* autoconf automake libtool
 * make
 * Python and modules.
 
   Python interpreter is not necessary for building Tarantool itself, unless you
   intend to use the “Run the test suite". For all platforms, this is python
-  version 2.7+ (but not 3.x). You need the following Python modules:
+  version 3.x. You need the following Python modules:
   * pyyaml
-  * argparse
-  * msgpack-python
   * gevent
   * six
 
@@ -32,17 +29,16 @@ CentOS:
 
 ```bash
 yum install -y \
-    git perl gcc cmake make gcc-c++ libstdc++-static autoconf automake libtool \
-    python-msgpack python-yaml python-argparse python-six python-gevent
+    git perl gcc cmake make gcc-c++ libstdc++-static \
+    python3-msgpack python3-yaml python3-six python3-gevent
 ```
 
 Ubuntu/Debian:
 
 ```bash
 apt-get install -y \
-    build-essential cmake make coreutils autoconf automake libtool sed \
-    python python-pip python-setuptools python-dev \
-    python-msgpack python-yaml python-argparse python-six python-gevent
+    build-essential cmake make coreutils sed \
+    python3 python3-msgpack python3-yaml python3-six python3-gevent
 ```
 
 MacOS:
@@ -60,8 +56,8 @@ Install brew using command from
 After that run next script:
 
 ```bash
-brew install autoconf automake libtool cmake file://$${PWD}/tools/brew_taps/tntpython2.rbs
-pip install --force-reinstall -r test-run/requirements.txt
+brew install cmake
+pip install --user --force-reinstall -r test-run/requirements.txt
 ```
 
 ## Usage

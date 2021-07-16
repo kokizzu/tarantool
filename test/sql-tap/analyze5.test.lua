@@ -21,12 +21,15 @@ local json = require("json")
 -- with many repeated values and only a few distinct values.
 --
 
-local testprefix = "analyze5"
-local function eqp(sql)
+local function eqp(sql) -- luacheck: no unused
     return test:execsql("EXPLAIN QUERY PLAN"..sql)
 end
 
-local function alpha(blob)
+-- Legacy from the original code. Must be replaced with analogue
+-- function.
+local X = nil
+
+local function alpha(blob) -- luacheck: no unused
     local ret = ""
     for _, c in ipairs(X(37, "X!cmd", [=[["split",["blob"],""]]=])) do
         if X(39, "X!cmd", [=[["string","is","alpha",["c"]]]=])
@@ -81,7 +84,7 @@ test:do_test(
             if  i >= 875 then
                 z = z + 1
             end
-            
+
             local x, w, t, u
             x = z
             w = z
@@ -132,7 +135,7 @@ test:do_test(
 --     "analyze5-1.1",
 --     function()
 --         return test:execsql([[
---             SELECT DISTINCT lower(lindex(test_decode(sample), 0)) 
+--             SELECT DISTINCT lower(lindex(test_decode(sample), 0))
 --               FROM _sql_stat4 WHERE idx='t1v' ORDER BY 1
 --         ]])
 
@@ -155,6 +158,11 @@ test:do_test(
 
 -- Verify that range queries generate the correct row count estimates
 --
+-- Legacy from the original code. Must be replaced with analogue
+-- functions.
+local t1x = nil
+local t1y = nil
+local t1z = nil
 for i, v in pairs({
 {'z>=0 AND z<=0',      t1z,  400},
 {'z>=1 AND z<=1',      t1z,  300},
@@ -238,7 +246,7 @@ for i, v in pairs({
 {'y=1',                t1y,   26},
 {'y=0.1',              t1y,    1},
 
-{'x IS NULL',          t1x,  400},        
+{'x IS NULL',          t1x,  400},
                  }) do
     -- Verify that the expected index is used with the expected row count
     -- No longer valid due to an EXPLAIN QUERY PLAN output format change

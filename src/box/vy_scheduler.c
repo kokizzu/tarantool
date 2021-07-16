@@ -861,7 +861,7 @@ vy_deferred_delete_process_one(struct space *deferred_delete_space,
 	tuple_unref(delete);
 
 	struct txn *txn = in_txn();
-	if (txn_begin_stmt(txn, deferred_delete_space) != 0)
+	if (txn_begin_stmt(txn, deferred_delete_space, request.type) != 0)
 		return -1;
 
 	struct tuple *unused;
@@ -920,7 +920,7 @@ vy_deferred_delete_batch_process_f(struct cmsg *cmsg)
 	return;
 
 fail_rollback:
-	txn_rollback(txn);
+	txn_abort(txn);
 	fiber_gc();
 fail:
 	batch->is_failed = true;
@@ -1454,6 +1454,17 @@ vy_task_compaction_complete(struct vy_task *task)
 	struct vy_run *run;
 
 	/*
+	 * The LSM tree could have been dropped while we were writing the new
+	 * run. In this case we should discard the run without committing to
+	 * vylog, because all the information about the LSM tree and its runs
+	 * could have already been garbage collected from vylog.
+	 */
+	if (lsm->is_dropped) {
+		vy_run_unref(new_run);
+		goto out;
+	}
+
+	/*
 	 * Allocate a slice of the new run.
 	 *
 	 * If the run is empty, we don't need to allocate a new slice
@@ -1580,7 +1591,7 @@ vy_task_compaction_complete(struct vy_task *task)
 		vy_slice_wait_pinned(slice);
 		vy_slice_delete(slice);
 	}
-
+out:
 	/* The iterator has been cleaned up in worker. */
 	task->wi->iface->close(task->wi);
 
@@ -1714,7 +1725,7 @@ err_run:
 	vy_task_delete(task);
 err_task:
 	diag_log();
-	say_error("%s: could not start compacting range %s: %s",
+	say_error("%s: could not start compacting range %s",
 		  vy_lsm_name(lsm), vy_range_str(range));
 	return -1;
 }

@@ -13,13 +13,12 @@ test:plan(12)
 --    May you share freely, never taking more than you give.
 --
 -------------------------------------------------------------------------
--- 
+--
 -- Tests to verify that arithmetic operators do not change the type of
 -- input operands.  Ticket [a8a0d2996a]
 --
 -- ["set","testdir",[["file","dirname",["argv0"]]]]
 -- ["source",[["testdir"],"\/tester.tcl"]]
-local testprefix = "tkt-a8a0d2996a"
 test:do_execsql_test(
     1.0,
     [[

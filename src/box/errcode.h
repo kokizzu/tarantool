@@ -55,7 +55,7 @@ struct errcode_record {
 	/*  0 */_(ER_UNKNOWN,			"Unknown error") \
 	/*  1 */_(ER_ILLEGAL_PARAMS,		"Illegal parameters, %s") \
 	/*  2 */_(ER_MEMORY_ISSUE,		"Failed to allocate %u bytes in %s for %s") \
-	/*  3 */_(ER_TUPLE_FOUND,		"Duplicate key exists in unique index '%s' in space '%s'") \
+	/*  3 */_(ER_TUPLE_FOUND,		"Duplicate key exists in unique index \"%s\" in space \"%s\" with old tuple - %s and new tuple - %s") \
 	/*  4 */_(ER_TUPLE_NOT_FOUND,		"Tuple doesn't exist in index '%s' in space '%s'") \
 	/*  5 */_(ER_UNSUPPORTED,		"%s does not support %s") \
 	/*  6 */_(ER_NONMASTER,			"Can't modify data on a replication slave. My master is: %s") \
@@ -75,7 +75,7 @@ struct errcode_record {
 	/* 20 */_(ER_INVALID_MSGPACK,		"Invalid MsgPack - %s") \
 	/* 21 */_(ER_PROC_RET,			"msgpack.encode: can not encode Lua type '%s'") \
 	/* 22 */_(ER_TUPLE_NOT_ARRAY,		"Tuple/Key must be MsgPack array") \
-	/* 23 */_(ER_FIELD_TYPE,		"Tuple field %s type does not match one required by operation: expected %s") \
+	/* 23 */_(ER_FIELD_TYPE,		"Tuple field %s type does not match one required by operation: expected %s, got %s") \
 	/* 24 */_(ER_INDEX_PART_TYPE_MISMATCH,	"Field %s has type '%s' in one index, but type '%s' in another") \
 	/* 25 */_(ER_UPDATE_SPLICE,		"SPLICE error on field %s: %s") \
 	/* 26 */_(ER_UPDATE_ARG_TYPE,		"Argument type in operation '%c' on field %s does not match field type: expected %s") \
@@ -186,7 +186,7 @@ struct errcode_record {
 	/*131 */_(ER_INVALID_INDEX_FILE,	"Invalid INDEX file %s: %s") \
 	/*132 */_(ER_INVALID_RUN_FILE,		"Invalid RUN file: %s") \
 	/*133 */_(ER_INVALID_VYLOG_FILE,	"Invalid VYLOG file: %s") \
-	/*134 */_(ER_CHECKPOINT_ROLLBACK,	"Can't start a checkpoint while in cascading rollback") \
+	/*134 */_(ER_CASCADE_ROLLBACK,		"WAL has a rollback in progress") \
 	/*135 */_(ER_VY_QUOTA_TIMEOUT,		"Timed out waiting for Vinyl memory quota") \
 	/*136 */_(ER_PARTIAL_KEY,		"%s index  does not support selects via a partial key (expected %u parts, got %u). Please Consider changing index type to TREE.") \
 	/*137 */_(ER_TRUNCATE_SYSTEM_SPACE,	"Can't truncate a system space, space '%s'") \
@@ -275,6 +275,9 @@ struct errcode_record {
 	/*220 */_(ER_TOO_EARLY_SUBSCRIBE,	"Can't subscribe non-anonymous replica %s until join is done") \
 	/*221 */_(ER_SQL_CANT_ADD_AUTOINC,	"Can't add AUTOINCREMENT: space %s can't feature more than one AUTOINCREMENT field") \
 	/*222 */_(ER_QUORUM_WAIT,		"Couldn't wait for quorum %d: %s") \
+	/*223 */_(ER_INTERFERING_PROMOTE,	"Instance with replica id %u was promoted first") \
+	/*224 */_(ER_RAFT_DISABLED,		"Elections were turned off while running box.ctl.promote()")\
+	/*225 */_(ER_TXN_ROLLBACK,		"Transaction was rolled back") \
 
 /*
  * !IMPORTANT! Please follow instructions at start of the file

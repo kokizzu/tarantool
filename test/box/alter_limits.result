@@ -92,9 +92,12 @@ s.id
 - 3000
 ...
 -- duplicate id
-box.schema.space.create('tweedledee', { id = 3000 })
+err, res = pcall(function() return box.schema.space.create('tweedledee', { id = 3000 }) end)
 ---
-- error: Duplicate key exists in unique index 'primary' in space '_space'
+...
+assert(res.code == box.error.TUPLE_FOUND)
+---
+- true
 ...
 -- stupid space id
 box.schema.space.create('tweedledee', { id = 'tweedledee' })
@@ -734,9 +737,12 @@ s.index.second.id
 index = s:create_index('third', { type = 'hash', parts = {  3, 'unsigned' } })
 ---
 ...
-s.index.third:rename('second')
+err, res = pcall(function() return s.index.third:rename('second') end)
 ---
-- error: Duplicate key exists in unique index 'name' in space '_index'
+...
+assert(res.code == box.error.TUPLE_FOUND)
+---
+- true
 ...
 s.index.third.id
 ---
@@ -817,12 +823,14 @@ s.index.primary:select{}
 -- a duplicate in the created index
 index = s:create_index('nodups', { type = 'tree', unique=true, parts = { 2, 'unsigned'} })
 ---
-- error: Duplicate key exists in unique index 'nodups' in space 'full'
+- error: Duplicate key exists in unique index "nodups" in space "full" with old tuple
+    - ["Barbara", 2012] and new tuple - ["Cloud Atlas", 2012]
 ...
 -- change of non-unique index to unique: same effect
 s.index.year:alter({unique=true})
 ---
-- error: Duplicate key exists in unique index 'year' in space 'full'
+- error: Duplicate key exists in unique index "year" in space "full" with old tuple
+    - ["Barbara", 2012] and new tuple - ["Cloud Atlas", 2012]
 ...
 s.index.primary:select{}
 ---
@@ -854,7 +862,8 @@ s:insert{'Der Baader Meinhof Komplex', '2009 '}
 -- create an index on a field with a wrong type
 index = s:create_index('year', { type = 'tree', unique = false, parts = { 2, 'unsigned'}})
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 2 type does not match one required by operation: expected unsigned,
+    got string'
 ...
 -- a field is missing
 s:replace{'Der Baader Meinhof Komplex'}
@@ -895,7 +904,8 @@ s:insert{2, 1}
 ...
 s.index.secondary:alter{ unique = true }
 ---
-- error: Duplicate key exists in unique index 'secondary' in space 'test'
+- error: Duplicate key exists in unique index "secondary" in space "test" with old
+    tuple - [1, 1] and new tuple - [2, 1]
 ...
 s:delete{2}
 ---
@@ -906,7 +916,8 @@ s.index.secondary:alter{ unique = true }
 ...
 s:insert{2, 1}
 ---
-- error: Duplicate key exists in unique index 'secondary' in space 'test'
+- error: Duplicate key exists in unique index "secondary" in space "test" with old
+    tuple - [1, 1] and new tuple - [2, 1]
 ...
 s:insert{2, 2}
 ---

@@ -40,6 +40,7 @@
 #include "box/coll_id_cache.h"
 #include "coll/coll.h"
 #include "sqlInt.h"
+#include "mem.h"
 #include "whereInt.h"
 
 /* Forward declarations */
@@ -311,8 +312,9 @@ like_optimization_is_valid(Parse *pParse, Expr *pExpr, Expr **ppPrefix,
 		pVal =
 		    sqlVdbeGetBoundValue(pReprepare, iCol,
 					     FIELD_TYPE_SCALAR);
-		if (pVal && sql_value_type(pVal) == MP_STR) {
-			z = (char *)sql_value_text(pVal);
+		if (pVal != NULL && mem_is_str(pVal)) {
+			if (mem_as_str0(pVal) == NULL)
+				return -1;
 		}
 		assert(pRight->op == TK_VARIABLE || pRight->op == TK_REGISTER);
 	} else if (op == TK_STRING) {

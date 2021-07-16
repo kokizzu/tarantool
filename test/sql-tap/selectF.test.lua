@@ -20,7 +20,6 @@ test:plan(2)
 --
 -- ["set","testdir",[["file","dirname",["argv0"]]]]
 -- ["source",[["testdir"],"\/tester.tcl"]]
-local testprefix = "selectF"
 test:do_execsql_test(
     1,
     [[
@@ -37,16 +36,16 @@ test:do_execsql_test(
 
 --explain_i {
 --  SELECT * FROM t2
---  UNION ALL 
---  SELECT * FROM t1 WHERE a<5 
+--  UNION ALL
+--  SELECT * FROM t1 WHERE a<5
 --  ORDER BY 2, 1
 --}
 test:do_execsql_test(
     2,
     [[
         SELECT * FROM t2
-        UNION ALL 
-        SELECT * FROM t1 WHERE a<5 
+        UNION ALL
+        SELECT * FROM t1 WHERE a<5
         ORDER BY 2, 1
     ]], {
         -- <2>

@@ -13,14 +13,13 @@ test:plan(7)
 --    May you share freely, never taking more than you give.
 --
 -------------------------------------------------------------------------
--- The focus of this file is testing the OR optimization on WITHOUT ROWID 
+-- The focus of this file is testing the OR optimization on WITHOUT ROWID
 -- tables.
 --
 -- Note: Tarantool has no rowid support, so all tables are WITHOUT ROWID.
 --
 -- ["set","testdir",[["file","dirname",["argv0"]]]]
 -- ["source",[["testdir"],"\/tester.tcl"]]
-local testprefix = "whereI"
 test:do_execsql_test(1.0, [[
     CREATE TABLE t1(a INT, b TEXT, c TEXT, PRIMARY KEY(a));
     INSERT INTO t1 VALUES(1, 'a', 'z');
@@ -34,7 +33,7 @@ test:do_execsql_test(1.0, [[
 -- do_eqp_test 1.1 {
 --   SELECT a FROM t1 WHERE b='b' OR c='x'
 -- } {
---   0 0 0 {SEARCH TABLE t1 USING INDEX i1 (b=?)} 
+--   0 0 0 {SEARCH TABLE t1 USING INDEX i1 (b=?)}
 --   0 0 0 {SEARCH TABLE t1 USING INDEX i2 (c=?)}
 -- }
 test:do_execsql_test(1.2, [[
@@ -69,7 +68,7 @@ test:do_execsql_test(2.0, [[
 -- do_eqp_test 2.1 {
 --   SELECT a FROM t2 WHERE b='b' OR c='x'
 -- } {
---   0 0 0 {SEARCH TABLE t2 USING INDEX i3 (b=?)} 
+--   0 0 0 {SEARCH TABLE t2 USING INDEX i3 (b=?)}
 --   0 0 0 {SEARCH TABLE t2 USING INDEX i4 (c=?)}
 -- }
 test:do_execsql_test(2.2, [[

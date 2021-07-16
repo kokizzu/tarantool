@@ -41,7 +41,26 @@ struct fiber;
 struct wal_writer;
 struct tt_uuid;
 
-enum wal_mode { WAL_NONE = 0, WAL_WRITE, WAL_FSYNC, WAL_MODE_MAX };
+enum wal_mode {
+	/**
+	 * Do not write data at all.
+	 */
+	WAL_NONE = 0,
+
+	/**
+	 * Write without waiting the data to be
+	 * flushed to the storage device.
+	 */
+	WAL_WRITE,
+
+	/**
+	 * Write data and wait the record to be
+	 * flushed to the storage device.
+	 */
+	WAL_FSYNC,
+
+	WAL_MODE_MAX
+};
 
 enum {
 	/**
@@ -49,7 +68,7 @@ enum {
 	 * applied from WAL. It allows not to block the event
 	 * loop for the whole recovery stage.
 	 */
-	WAL_ROWS_PER_YIELD = 32000,
+	WAL_ROWS_PER_YIELD = 1 << 15,
 };
 
 /** String constants for the supported modes. */
@@ -236,6 +255,13 @@ wal_commit_checkpoint(struct wal_checkpoint *checkpoint);
  */
 void
 wal_set_checkpoint_threshold(int64_t threshold);
+
+/**
+ * Set the pending write limit in bytes. Once the limit is reached, new
+ * writes are blocked until some previous writes succeed.
+ */
+void
+wal_set_queue_max_size(int64_t size);
 
 /**
  * Remove WAL files that are not needed by consumers reading

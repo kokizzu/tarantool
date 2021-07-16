@@ -60,7 +60,8 @@ mp_decode_num(const char **data, uint32_t fieldno, double *ret)
 	if (mp_read_double(data, ret) != 0) {
 		diag_set(ClientError, ER_FIELD_TYPE,
 			 int2str(fieldno + TUPLE_INDEX_BASE),
-			 field_type_strs[FIELD_TYPE_NUMBER]);
+			 field_type_strs[FIELD_TYPE_NUMBER],
+			 mp_type_strs[mp_typeof(**data)]);
 		return -1;
 	}
 	return 0;
@@ -155,11 +156,11 @@ index_rtree_iterator_next(struct iterator *i, struct tuple **ret)
 		*ret = (struct tuple *) rtree_iterator_next(&itr->impl);
 		if (*ret == NULL)
 			break;
-		uint32_t iid = i->index->def->iid;
+		struct index *idx = i->index;
 		struct txn *txn = in_txn();
 		struct space *space = space_by_id(i->space_id);
 		bool is_rw = txn != NULL;
-		*ret = memtx_tx_tuple_clarify(txn, space, *ret, iid, 0, is_rw);
+		*ret = memtx_tx_tuple_clarify(txn, space, *ret, idx, 0, is_rw);
 	} while (*ret == NULL);
 	return 0;
 }
@@ -193,7 +194,10 @@ static ssize_t
 memtx_rtree_index_size(struct index *base)
 {
 	struct memtx_rtree_index *index = (struct memtx_rtree_index *)base;
-	return rtree_number_of_records(&index->tree);
+	struct space *space = space_by_id(base->def->space_id);
+	/* Substract invisible count. */
+	return rtree_number_of_records(&index->tree) -
+	       memtx_tx_index_invisible_count(in_txn(), space, base);
 }
 
 static ssize_t
@@ -209,6 +213,7 @@ memtx_rtree_index_count(struct index *base, enum iterator_type type,
 {
 	if (type == ITER_ALL)
 		return memtx_rtree_index_size(base); /* optimization */
+
 	return generic_index_count(base, type, key, part_count);
 }
 
@@ -234,11 +239,10 @@ memtx_rtree_index_get(struct index *base, const char *key,
 			rtree_iterator_next(&iterator);
 		if (tuple == NULL)
 			break;
-		uint32_t iid = base->def->iid;
 		struct txn *txn = in_txn();
 		struct space *space = space_by_id(base->def->space_id);
 		bool is_rw = txn != NULL;
-		*result = memtx_tx_tuple_clarify(txn, space, tuple, iid,
+		*result = memtx_tx_tuple_clarify(txn, space, tuple, base,
 						 0, is_rw);
 	} while (*result == NULL);
 	rtree_iterator_destroy(&iterator);
@@ -248,10 +252,14 @@ memtx_rtree_index_get(struct index *base, const char *key,
 static int
 memtx_rtree_index_replace(struct index *base, struct tuple *old_tuple,
 			  struct tuple *new_tuple, enum dup_replace_mode mode,
-			  struct tuple **result)
+			  struct tuple **result, struct tuple **successor)
 {
 	(void)mode;
 	struct memtx_rtree_index *index = (struct memtx_rtree_index *)base;
+
+	/* RTREE index doesn't support ordering. */
+	*successor = NULL;
+
 	struct rtree_rect rect;
 	if (new_tuple) {
 		if (extract_rectangle(&rect, new_tuple, base->def) != 0)

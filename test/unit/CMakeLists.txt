@@ -33,6 +33,8 @@ add_executable(mhash_bytemap.test mhash_bytemap.c)
 target_link_libraries(mhash_bytemap.test unit)
 add_executable(rope_basic.test rope_basic.c)
 target_link_libraries(rope_basic.test salad)
+add_executable(gh-5788-rope-insert-oom.test gh-5788-rope-insert-oom.c)
+target_link_libraries(gh-5788-rope-insert-oom.test salad unit)
 add_executable(rope_avl.test rope_avl.c)
 target_link_libraries(rope_avl.test salad)
 add_executable(rope_stress.test rope_stress.c)
@@ -230,6 +232,9 @@ target_link_libraries(coll.test coll unit misc ${LIB_DL})
 add_executable(tuple_bigref.test tuple_bigref.c core_test_utils.c)
 target_link_libraries(tuple_bigref.test tuple unit)
 
+add_executable(tuple_uint32_overflow.test tuple_uint32_overflow.c core_test_utils.c)
+target_link_libraries(tuple_uint32_overflow.test tuple unit)
+
 add_executable(checkpoint_schedule.test
     checkpoint_schedule.c
     ${PROJECT_SOURCE_DIR}/src/box/checkpoint_schedule.c
@@ -270,3 +275,6 @@ add_executable(popen-child popen-child.c)
 
 add_executable(popen.test popen.c core_test_utils.c)
 target_link_libraries(popen.test misc unit core)
+
+add_executable(serializer.test serializer.c)
+target_link_libraries(serializer.test unit box ${LUAJIT_LIBRARIES})

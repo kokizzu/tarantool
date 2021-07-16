@@ -49,7 +49,7 @@ test:do_execsql_test(
     [[
         SELECT 't1', * FROM "t1";
         SELECT 't2', * FROM t2;
-        SELECT 'space_table', * FROM SPACE_TABLE;  
+        SELECT 'space_table', * FROM SPACE_TABLE;
     ]], {
         -- <alter-1.4>
         "space_table", 1, 5, 6, 7
@@ -541,12 +541,13 @@ test:do_test(
         return box.space.T.index[0].id
     end, 0)
 
-test:do_catchsql_test(
+test:do_catchsql_prefix_test(
     "alter-8.2",
     [[
         ALTER TABLE t ADD CONSTRAINT pk1 PRIMARY KEY("f2");
-    ]], {
-        1, "Duplicate key exists in unique index 'primary' in space '_index'"
+    ]],
+    " with old tuple - ", {
+        1, "Duplicate key exists in unique index \"primary\" in space \"_index\""
     })
 
 test:do_catchsql_test(

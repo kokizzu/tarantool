@@ -1,5 +1,5 @@
 	*** main_f ***
-1..13
+1..14
 	*** raft_test_leader_election ***
     1..24
     ok 1 - 1 pending message at start
@@ -45,7 +45,7 @@ ok 1 - subtests
 ok 2 - subtests
 	*** raft_test_recovery: done ***
 	*** raft_test_bad_msg ***
-    1..9
+    1..11
     ok 1 - state can't be 0
     ok 2 - term from the bad message wasn't used
     ok 3 - node can't be a candidate but vote for another node
@@ -55,6 +55,8 @@ ok 2 - subtests
     ok 7 - term can't be 0
     ok 8 - bad state
     ok 9 - term from the bad message wasn't used
+    ok 10 - bad negative state
+    ok 11 - term from the bad message wasn't used
 ok 3 - subtests
 	*** raft_test_bad_msg: done ***
 	*** raft_test_vote ***
@@ -111,7 +113,7 @@ ok 4 - subtests
 ok 5 - subtests
 	*** raft_test_vote_skip: done ***
 	*** raft_test_leader_resign ***
-    1..15
+    1..23
     ok 1 - message is accepted
     ok 2 - leader is elected
     ok 3 - message is accepted
@@ -127,6 +129,14 @@ ok 5 - subtests
     ok 13 - became leader
     ok 14 - the leader has resigned
     ok 15 - resign notification is sent
+    ok 16 - new election is waiting for WAL write
+    ok 17 - message is accepted
+    ok 18 - the leader is accepted
+    ok 19 - message is accepted
+    ok 20 - the leader has resigned, new election is scheduled
+    ok 21 - vote from 2
+    ok 22 - vote from 3
+    ok 23 - the leader is elected
 ok 6 - subtests
 	*** raft_test_leader_resign: done ***
 	*** raft_test_split_brain ***
@@ -220,4 +230,16 @@ ok 12 - subtests
     ok 8 - became candidate
 ok 13 - subtests
 	*** raft_test_too_long_wal_write: done ***
+	*** raft_test_start_stop_candidate ***
+    1..8
+    ok 1 - became leader after start candidate
+    ok 2 - remain leader after stop candidate
+    ok 3 - demote drops a non-candidate leader to a follower
+    ok 4 - non-candidate but still leader
+    ok 5 - vote request from 2
+    ok 6 - demote once new election starts
+    ok 7 - still follower
+    ok 8 - still the same term
+ok 14 - subtests
+	*** raft_test_start_stop_candidate: done ***
 	*** main_f: done ***

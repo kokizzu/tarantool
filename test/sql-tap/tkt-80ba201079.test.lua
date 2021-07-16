@@ -22,7 +22,6 @@ test:plan(11)
 -- ["set","testdir",[["file","dirname",["argv0"]]]]
 -- ["source",[["testdir"],"\/tester.tcl"]]
 
-local testprefix = "tkt-80ba201079"
 test:do_test(
     "tkt-80ba2-100",
     function()
@@ -73,13 +72,13 @@ test:do_test(
 -- do_test tkt-80ba2-150 {
 --   optimization_control db factor-constants 1
 --   db cache flush
---   set x1 [db eval {EXPLAIN 
+--   set x1 [db eval {EXPLAIN
 --     SELECT * FROM t1, t2
 --      WHERE (a='A' AND b='X')
 --         OR (a='A' AND EXISTS (SELECT * FROM t3 WHERE c='C'));}]
 --   optimization_control db factor-constants 0
 --   db cache flush
---   set x2 [db eval {EXPLAIN 
+--   set x2 [db eval {EXPLAIN
 --     SELECT * FROM t1, t2
 --      WHERE (a='A' AND b='X')
 --         OR (a='A' AND EXISTS (SELECT * FROM t3 WHERE c='C'));}]

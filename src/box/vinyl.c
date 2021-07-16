@@ -640,6 +640,7 @@ vinyl_engine_create_space(struct engine *engine, struct space_def *def,
 static void
 vinyl_space_destroy(struct space *space)
 {
+	TRASH(space);
 	free(space);
 }
 
@@ -1513,9 +1514,9 @@ vy_check_is_unique_primary(struct vy_tx *tx, const struct vy_read_view **rv,
 	if (vy_get(lsm, tx, rv, stmt, &found))
 		return -1;
 	if (found != NULL) {
+		diag_set(ClientError, ER_TUPLE_FOUND, index_name, space_name,
+			 tuple_str(found), tuple_str(stmt));
 		tuple_unref(found);
-		diag_set(ClientError, ER_TUPLE_FOUND,
-			 index_name, space_name);
 		return -1;
 	}
 	return 0;
@@ -1561,9 +1562,9 @@ vy_check_is_unique_secondary_one(struct vy_tx *tx, const struct vy_read_view **r
 		return 0;
 	}
 	if (found != NULL) {
+		diag_set(ClientError, ER_TUPLE_FOUND, index_name, space_name,
+			 tuple_str(found), tuple_str(stmt));
 		tuple_unref(found);
-		diag_set(ClientError, ER_TUPLE_FOUND,
-			 index_name, space_name);
 		return -1;
 	}
 	return 0;
@@ -2838,7 +2839,8 @@ vinyl_engine_begin_initial_recovery(struct engine *engine,
 	assert(e->status == VINYL_OFFLINE);
 	if (recovery_vclock != NULL) {
 		e->recovery_vclock = recovery_vclock;
-		e->recovery = vy_log_begin_recovery(recovery_vclock);
+		e->recovery = vy_log_begin_recovery(recovery_vclock,
+						    e->force_recovery);
 		if (e->recovery == NULL)
 			return -1;
 		/*
@@ -3032,6 +3034,7 @@ vinyl_engine_join(struct engine *engine, void *arg, struct xstream *stream)
 		if (++loops % VY_YIELD_LOOPS == 0)
 			fiber_sleep(0);
 	}
+	xstream_reset(stream);
 	return 0;
 }
 

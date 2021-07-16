@@ -215,11 +215,11 @@ bitset_index_iterator_next(struct iterator *iterator, struct tuple **ret)
 #else /* #ifndef OLD_GOOD_BITSET */
 		struct tuple *tuple = value_to_tuple(value);
 #endif /* #ifndef OLD_GOOD_BITSET */
-		uint32_t iid = iterator->index->def->iid;
+		struct index *idx = iterator->index;
 		struct txn *txn = in_txn();
 		struct space *space = space_by_id(iterator->space_id);
 		bool is_rw = txn != NULL;
-		*ret = memtx_tx_tuple_clarify(txn, space, tuple, iid, 0, is_rw);
+		*ret = memtx_tx_tuple_clarify(txn, space, tuple, idx, 0, is_rw);
 	} while (*ret == NULL);
 
 	return 0;
@@ -242,7 +242,10 @@ static ssize_t
 memtx_bitset_index_size(struct index *base)
 {
 	struct memtx_bitset_index *index = (struct memtx_bitset_index *)base;
-	return tt_bitset_index_size(&index->index);
+	struct space *space = space_by_id(base->def->space_id);
+	/* Substract invisible count. */
+	return tt_bitset_index_size(&index->index) -
+	       memtx_tx_index_invisible_count(in_txn(), space, base);
 }
 
 static ssize_t
@@ -284,9 +287,12 @@ make_key(const char *field, uint32_t *key_len)
 static int
 memtx_bitset_index_replace(struct index *base, struct tuple *old_tuple,
 			   struct tuple *new_tuple, enum dup_replace_mode mode,
-			   struct tuple **result)
+			   struct tuple **result, struct tuple **successor)
 {
 	struct memtx_bitset_index *index = (struct memtx_bitset_index *)base;
+
+	/* BITSET index doesn't support ordering. */
+	*successor = NULL;
 
 	assert(!base->def->opts.is_unique);
 	assert(!base->def->key_def->is_multikey);
@@ -427,7 +433,7 @@ memtx_bitset_index_count(struct index *base, enum iterator_type type,
 	struct memtx_bitset_index *index = (struct memtx_bitset_index *)base;
 
 	if (type == ITER_ALL)
-		return tt_bitset_index_size(&index->index);
+		return memtx_bitset_index_size(base);
 
 	assert(part_count == 1); /* checked by key_validate() */
 	uint32_t bitset_key_size = 0;

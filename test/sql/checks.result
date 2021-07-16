@@ -1,6 +1,9 @@
 env = require('test_run')
 ---
 ...
+ffi = require 'ffi'
+---
+...
 test_run = env.new()
 ---
 ...
@@ -49,7 +52,8 @@ box.space._ck_constraint:insert({550, 'CK_CONSTRAINT_01', false, 'SQL', 'X<5', t
 -- Pass integer instead of expression.
 box.space._ck_constraint:insert({513, 'CK_CONSTRAINT_01', false, 'SQL', 666, true})
 ---
-- error: 'Tuple field 5 type does not match one required by operation: expected string'
+- error: 'Tuple field 5 (code) type does not match one required by operation: expected
+    string, got unsigned'
 ...
 -- Deferred CK constraints are not supported.
 box.space._ck_constraint:insert({513, 'CK_CONSTRAINT_01', true, 'SQL', 'X<5', true})
@@ -392,11 +396,12 @@ _ = box.space._ck_constraint:insert({s.id, 'XlessY', false, 'SQL', 'X < Y and Y 
 ...
 s:insert({'1', 2})
 ---
-- error: 'Tuple field 1 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 1 (X) type does not match one required by operation: expected
+    unsigned, got string'
 ...
 s:insert({})
 ---
-- error: Tuple field 1 required by space format is missing
+- error: Tuple field 1 (X) required by space format is missing
 ...
 s:insert({2, 1})
 ---
@@ -625,9 +630,23 @@ test_run:cmd("push filter 'space_id: [0-9]+' to 'space_id: <ID>'")
 _ = s1:create_check_constraint('physics', 'X < Y')
 ---
 ...
-_ = s1:create_check_constraint('physics', 'X > Y')
+_, error = pcall(function() return s1:create_check_constraint('physics', 'X > Y') end)
 ---
-- error: Duplicate key exists in unique index 'primary' in space '_ck_constraint'
+...
+-- Check code of error
+error.code
+---
+- 3
+...
+-- Check index
+string.match(ffi.string(error._errmsg), 'primary')
+---
+- primary
+...
+-- Check space
+string.match(ffi.string(error._errmsg), '_ck_constraint')
+---
+- _ck_constraint
 ...
 _ = s1:create_check_constraint('greater', 'X > 20')
 ---

@@ -1,6 +1,7 @@
 local ffi = require('ffi')
 local buffer = require('buffer')
-local static_alloc = buffer.static_alloc
+local cord_ibuf_take = buffer.internal.cord_ibuf_take
+local cord_ibuf_put = buffer.internal.cord_ibuf_put
 
 ffi.cdef[[
     const char *
@@ -15,8 +16,6 @@ ffi.cdef[[
 ]]
 
 local c_char_ptr     = ffi.typeof('const char *')
-local strip_newstart = buffer.reg1.aul
-local strip_newlen   = buffer.reg2.aul
 
 local memcmp  = ffi.C.memcmp
 local memmem  = ffi.C.memmem
@@ -291,13 +290,16 @@ local function string_hex(inp)
         error(err_string_arg:format(1, 'string.hex', 'string', type(inp)), 2)
     end
     local len = inp:len() * 2
-    local res = static_alloc('char', len + 1)
+    local ibuf = cord_ibuf_take()
+    local res = ibuf:alloc(len + 1)
 
     local uinp = ffi.cast('const unsigned char *', inp)
     for i = 0, inp:len() - 1 do
         ffi.C.snprintf(res + i * 2, 3, "%02x", ffi.cast('unsigned', uinp[i]))
     end
-    return ffi.string(res, len)
+    res = ffi.string(res, len)
+    cord_ibuf_put(ibuf)
+    return res
 end
 
 local hexadecimal_chars = {
@@ -334,17 +336,21 @@ local function string_fromhex(inp)
     end
     local len = inp:len() / 2
     local casted_inp = ffi.cast('const char *', inp)
-    local res = static_alloc('char', len)
+    local ibuf = cord_ibuf_take()
+    local res = ibuf:alloc(len)
     for i = 0, len - 1 do
         local first = hexadecimals_mapping[casted_inp[i * 2]]
         local second = hexadecimals_mapping[casted_inp[i * 2 + 1]]
         if first == nil or second == nil then
+            cord_ibuf_put(ibuf)
             error(err_string_arg:format(1, 'string.fromhex', 'hex string',
                                         'non hex chars'), 2)
         end
         res[i] = first * 16 + second
     end
-    return ffi.string(res, len)
+    res = ffi.string(res, len)
+    cord_ibuf_put(ibuf)
+    return res
 end
 
 local function string_strip(inp, chars)
@@ -363,6 +369,8 @@ local function string_strip(inp, chars)
     end
 
     local casted_inp = c_char_ptr(inp)
+    local strip_newstart = ffi.new('unsigned long[1]')
+    local strip_newlen = ffi.new('unsigned long[1]')
     ffi.C.string_strip_helper(inp, #inp, chars, #chars, true, true,
                               strip_newstart, strip_newlen)
     return ffi.string(casted_inp + strip_newstart[0], strip_newlen[0])
@@ -384,6 +392,8 @@ local function string_lstrip(inp, chars)
     end
 
     local casted_inp = c_char_ptr(inp)
+    local strip_newstart = ffi.new('unsigned long[1]')
+    local strip_newlen = ffi.new('unsigned long[1]')
     ffi.C.string_strip_helper(inp, #inp, chars, #chars, true, false,
                               strip_newstart, strip_newlen)
     return ffi.string(casted_inp + strip_newstart[0], strip_newlen[0])
@@ -405,6 +415,8 @@ local function string_rstrip(inp, chars)
     end
 
     local casted_inp = c_char_ptr(inp)
+    local strip_newstart = ffi.new('unsigned long[1]')
+    local strip_newlen = ffi.new('unsigned long[1]')
     ffi.C.string_strip_helper(inp, #inp, chars, #chars, false, true,
                               strip_newstart, strip_newlen)
     return ffi.string(casted_inp + strip_newstart[0], strip_newlen[0])

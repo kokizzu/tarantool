@@ -1,5 +1,6 @@
 #!/usr/bin/env tarantool
 
+local ffi = require('ffi')
 local fio = require('fio')
 
 box.cfg{log = "tarantool.log"}
@@ -39,20 +40,20 @@ local function test_pushcdata(test, module)
 end
 
 local function test_buffers(test, module)
-    test:plan(9)
+    test:plan(8)
     local buffer = require('buffer')
 
-    local bufalloc = buffer.static_alloc("char", 128)
+    local bufalloc = ffi.new('char[?]', 128)
     local ibuf = buffer.ibuf()
     local pbuf = ibuf:alloc(128)
+    local ibuf_ptr = ffi.cast('struct ibuf *', ibuf)
 
     test:ok(not module.toibuf(nil), 'toibuf of nil')
     test:ok(not module.toibuf({}), 'toibuf of {}')
     test:ok(not module.toibuf(1LL), 'toibuf of 1LL')
     test:ok(not module.toibuf(box.NULL), 'toibuf of box.NULL')
-    test:ok(not module.toibuf(buffer.reg1), 'toibuf of reg1')
     test:ok(not module.toibuf(bufalloc), 'toibuf of allocated buffer')
-    test:ok(module.toibuf(buffer.IBUF_SHARED), "toibuf of ibuf*")
+    test:ok(module.toibuf(ibuf_ptr), "toibuf of ibuf*")
     test:ok(module.toibuf(ibuf), 'toibuf of ibuf')
     test:ok(not module.toibuf(pbuf), 'toibuf of pointer to ibuf data')
 end

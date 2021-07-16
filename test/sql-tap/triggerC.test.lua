@@ -16,7 +16,6 @@ test:plan(43)
 --
 -- ["set","testdir",[["file","dirname",["argv0"]]]]
 -- ["source",[["testdir"],"\/tester.tcl"]]
-local testprefix = "triggerC"
 
 
 ---------------------------------------------------------------------------
@@ -239,7 +238,7 @@ test:do_catchsql_test(
         UPDATE OR ROLLBACK t1 SET a=100;
     ]], {
         -- <triggerC-1.15>
-        1, "Duplicate key exists in unique index 'unique_unnamed_T1_1' in space 'T1'"
+        1, "Duplicate key exists in unique index \"unique_unnamed_T1_1\" in space \"T1\" with old tuple - [100, 2, 3, 4, 5] and new tuple - [100, 7, 8, 9, 10]"
         -- </triggerC-1.15>
     })
 
@@ -780,6 +779,8 @@ for testno, v in ipairs(tests11) do
     --         -- X(891, "X!cmd", [=[["concat",["defaults"],["defaults"]]]=])
     --     })
 
+    -- Legacy from the original code. Must be replaced with valid value.
+    local defaults = nil
     test:do_test(
         "triggerC-11."..testno..".3",
         function()

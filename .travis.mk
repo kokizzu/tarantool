@@ -11,7 +11,7 @@ OOS_SRC_PATH?=/source
 OOS_BUILD_PATH?=/rw_bins
 OOS_BUILD_RULE?=test_oos_no_deps
 BIN_DIR=/usr/local/bin
-OSX_VARDIR?=/tmp/tnt
+VARDIR?=/tmp/tnt
 GIT_DESCRIBE=$(shell git describe HEAD)
 COVERITY_BINS=/cov-analysis/bin
 
@@ -54,7 +54,6 @@ docker_%:
 		--workdir /tarantool \
 		-e XDG_CACHE_HOME=/cache \
 		-e CCACHE_DIR=/cache/ccache \
-		-e COVERALLS_TOKEN=${COVERALLS_TOKEN} \
 		-e TRAVIS_JOB_ID=${TRAVIS_JOB_ID} \
 		-e CMAKE_EXTRA_PARAMS=${CMAKE_EXTRA_PARAMS} \
 		-e APT_EXTRA_FLAGS="${APT_EXTRA_FLAGS}" \
@@ -82,14 +81,34 @@ docker_%:
 # commit, so the build requires old dependencies to be installed.
 # See ce623a23416eb192ce70116fd14992e84e7ccbbe ('Enable GitLab CI
 # testing') for more information.
-deps_debian:
+
+deps_tests:
+	pip install -r test-run/requirements.txt
+
+deps_ubuntu_ghactions: deps_tests
+	sudo apt-get update ${APT_EXTRA_FLAGS} && \
+		sudo apt-get install -y -f libreadline-dev libunwind-dev
+
+deps_coverage_ubuntu_ghactions: deps_ubuntu_ghactions
+	sudo apt-get install -y -f lcov
+	sudo gem install coveralls-lcov
+	# Link src/lib/uri/src to local src dircetory to avoid of issue:
+	# /var/lib/gems/2.7.0/gems/coveralls-lcov-1.7.0/lib/coveralls/lcov/converter.rb:64:in
+	#   `initialize': No such file or directory @ rb_sysopen -
+	#   /home/runner/work/tarantool/tarantool/src/lib/uri/src/lib/uri/uri.c (Errno::ENOENT)
+	ln -s ${PWD}/src src/lib/uri/src
+	
+deps_debian_packages:
 	apt-get update ${APT_EXTRA_FLAGS} && apt-get install -y -f \
 		build-essential cmake coreutils sed \
 		libreadline-dev libncurses5-dev libyaml-dev libssl-dev \
 		libcurl4-openssl-dev libunwind-dev libicu-dev \
 		python python-pip python-setuptools python-dev \
 		python-msgpack python-yaml python-argparse python-six python-gevent \
+		python3 python3-gevent python3-six python3-yaml \
 		lcov ruby clang llvm llvm-dev zlib1g-dev autoconf automake libtool
+
+deps_debian: deps_debian_packages deps_tests
 
 deps_buster_clang_8: deps_debian
 	echo "deb http://apt.llvm.org/buster/ llvm-toolchain-buster-8 main" > /etc/apt/sources.list.d/clang_8.list
@@ -133,9 +152,12 @@ build_debian: configure_debian
 	make -j
 
 test_debian_no_deps: build_debian
-	cd test && /usr/bin/python test-run.py --force $(TEST_RUN_EXTRA_PARAMS)
+	make LuaJIT-test
+	cd test && ./test-run.py --vardir ${VARDIR} --force $(TEST_RUN_EXTRA_PARAMS)
 
 test_debian: deps_debian test_debian_no_deps
+
+test_ubuntu_ghactions: deps_ubuntu_ghactions test_debian_no_deps
 
 test_debian_clang11: deps_debian deps_buster_clang_11 test_debian_no_deps
 
@@ -146,24 +168,18 @@ build_coverage_debian:
 	make -j
 
 test_coverage_debian_no_deps: build_coverage_debian
+	make LuaJIT-test
 	# Enable --long tests for coverage
-	cd test && /usr/bin/python test-run.py --force $(TEST_RUN_EXTRA_PARAMS) --long
+	cd test && ./test-run.py --vardir ${VARDIR} --force $(TEST_RUN_EXTRA_PARAMS) --long
 	lcov --compat-libtool --directory src/ --capture --output-file coverage.info.tmp \
 		--rc lcov_branch_coverage=1 --rc lcov_function_coverage=1
 	lcov --compat-libtool --remove coverage.info.tmp 'tests/*' 'third_party/*' '/usr/*' \
 		--rc lcov_branch_coverage=1 --rc lcov_function_coverage=1 --output-file coverage.info
 	lcov --list coverage.info
-	# coveralls API: https://docs.coveralls.io/api-reference
-	@if [ -n "$(COVERALLS_TOKEN)" ]; then \
-		echo "Exporting code coverage information to coveralls.io"; \
-		gem install coveralls-lcov; \
-		echo coveralls-lcov --service-name github-ci --service-job-id $(GITHUB_RUN_ID) \
-			--repo-token [FILTERED] coverage.info; \
-		coveralls-lcov --service-name github-ci --service-job-id $(GITHUB_RUN_ID) \
-			--repo-token $(COVERALLS_TOKEN) coverage.info; \
-	fi;
 
 coverage_debian: deps_debian test_coverage_debian_no_deps
+
+coverage_ubuntu_ghactions: deps_coverage_ubuntu_ghactions test_coverage_debian_no_deps
 
 # Coverity
 
@@ -204,6 +220,13 @@ build_asan_debian:
 	make -j
 
 test_asan_debian_no_deps: build_asan_debian
+	# FIXME: PUC-Rio-Lua-5.1 test suite is disabled for ASAN
+	# due to https://github.com/tarantool/tarantool/issues/5880.
+	# Run tests suites manually.
+	ASAN=ON \
+		LSAN_OPTIONS=suppressions=${PWD}/asan/lsan.supp \
+		ASAN_OPTIONS=heap_profile=0:unmap_shadow_on_exit=1:detect_invalid_pointer_pairs=1:symbolize=1:detect_leaks=1:dump_instruction_bytes=1:print_suppressions=0 \
+		make LuaJIT-tests lua-Harness-tests tarantool-tests
 	# Temporary excluded some tests by issue #4360:
 	#  - To exclude tests from ASAN checks the asan/asan.supp file
 	#    was set at the build time in cmake/profile.cmake file.
@@ -212,19 +235,21 @@ test_asan_debian_no_deps: build_asan_debian
 	cd test && ASAN=ON \
 		LSAN_OPTIONS=suppressions=${PWD}/asan/lsan.supp \
 		ASAN_OPTIONS=heap_profile=0:unmap_shadow_on_exit=1:detect_invalid_pointer_pairs=1:symbolize=1:detect_leaks=1:dump_instruction_bytes=1:print_suppressions=0 \
-		./test-run.py --force $(TEST_RUN_EXTRA_PARAMS)
+		./test-run.py --vardir ${VARDIR} --force $(TEST_RUN_EXTRA_PARAMS)
 
 test_asan_debian: deps_debian deps_buster_clang_11 test_asan_debian_no_deps
 
+test_asan_ubuntu_ghactions: deps_ubuntu_ghactions test_asan_debian_no_deps
+
 # Static build
 
-deps_debian_static:
+deps_debian_static: deps_tests
 	# Found that in Debian OS libunwind library built with dependencies to
 	# liblzma library, but there is no liblzma static library installed,
 	# while liblzma dynamic library exists. So the build dynamicaly has no
 	# issues, while static build fails. To fix it we need to install
 	# liblzma-dev package with static library only for static build.
-	apt-get install -y -f liblzma-dev
+	sudo apt-get install -y -f liblzma-dev
 
 test_static_build: deps_debian_static
 	CMAKE_EXTRA_PARAMS=-DBUILD_STATIC=ON make -f .travis.mk test_debian_no_deps
@@ -232,10 +257,11 @@ test_static_build: deps_debian_static
 # New static build
 # builddir used in this target - is a default build path from cmake
 # ExternalProject_Add()
-test_static_build_cmake_linux:
+test_static_build_cmake_linux: deps_tests
 	cd static-build && cmake -DCMAKE_TARANTOOL_ARGS="-DCMAKE_BUILD_TYPE=RelWithDebInfo;-DENABLE_WERROR=ON" . && \
 	make -j && ctest -V
-	cd test && /usr/bin/python test-run.py --force \
+	make -C ${PWD}/static-build/tarantool-prefix/src/tarantool-build LuaJIT-test
+	cd test && ./test-run.py --vardir ${VARDIR} --force \
 		--builddir ${PWD}/static-build/tarantool-prefix/src/tarantool-build $(TEST_RUN_EXTRA_PARAMS)
 
 # ###################
@@ -254,9 +280,9 @@ test_debian_docker_luacheck:
 		make -f .travis.mk test_debian_luacheck
 
 test_debian_install_luacheck:
-	apt update -y
-	apt install -y lua5.1 luarocks
-	luarocks install luacheck
+	sudo apt update -y
+	sudo apt install -y lua5.1 luarocks
+	sudo luarocks install luacheck
 
 test_debian_luacheck: test_debian_install_luacheck configure_debian
 	make luacheck
@@ -270,6 +296,7 @@ build_oos:
 		make -j
 
 test_oos_no_deps: build_oos
+	make -C ${OOS_BUILD_PATH} LuaJIT-test
 	cd ${OOS_BUILD_PATH}/test && \
 		${OOS_SRC_PATH}/test/test-run.py \
 			--builddir ${OOS_BUILD_PATH} \
@@ -290,13 +317,30 @@ test_oos_build:
 		-i ${DOCKER_IMAGE_TARANTOOL} \
 		make -f .travis.mk ${OOS_BUILD_RULE}
 
+# Odroid arm64
+
+deps_odroid_arm64:
+	sudo apt update -y && sudo apt -y install git build-essential cmake make zlib1g-dev \
+		libreadline-dev libncurses5-dev libssl-dev libunwind-dev libicu-dev python3 \
+		python3-six python3-gevent python3-pip
+
+build_odroid_arm64:
+	cmake . -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} ${CMAKE_EXTRA_PARAMS}
+	make -j
+
+test_odroid_arm64_no_deps: build_odroid_arm64
+	make LuaJIT-test
+
+test_odroid_arm64: deps_odroid_arm64 test_odroid_arm64_no_deps
+
 #######
 # OSX #
 #######
 
-# since Python 2 is EOL it's latest commit from tapped local formula is used
-OSX_PKGS_MIN=openssl readline curl icu4c libiconv zlib cmake
-OSX_PKGS=${OSX_PKGS_MIN} file://$${PWD}/tools/brew_taps/tntpython2.rb
+# FIXME: Temporary pinned python3 to specific version (i.e. python@3.8) to
+# avoid gevent package installation failure described in gevent/gevent#1721.
+# Revert this back when the issue is resolved.
+OSX_PKGS=openssl readline curl icu4c libiconv zlib cmake python@3.8
 
 deps_osx:
 	# install brew using command from Homebrew repository instructions:
@@ -309,16 +353,19 @@ deps_osx:
 	# try to install the packages either upgrade it to avoid of fails
 	# if the package already exists with the previous version
 	brew install --force ${OSX_PKGS} || brew upgrade ${OSX_PKGS}
-	pip install --force-reinstall -r test-run/requirements.txt
+	pip3 install --force-reinstall -r test-run/requirements.txt
 
 deps_osx_github_actions:
 	# try to install the packages either upgrade it to avoid of fails
 	# if the package already exists with the previous version
-	brew install --force ${OSX_PKGS_MIN} || brew upgrade ${OSX_PKGS_MIN}
-	pip install --force-reinstall -r test-run/requirements.txt
+	brew install --force ${OSX_PKGS} || brew upgrade ${OSX_PKGS}
+	pip3 install --force-reinstall -r test-run/requirements.txt
 
 build_osx:
-	cmake . -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_WERROR=ON ${CMAKE_EXTRA_PARAMS}
+	# due swap disabling should be manualy configured need to
+	# control it's status
+	sysctl vm.swapusage
+	cmake . -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} ${CMAKE_EXTRA_PARAMS}
 	make -j
 
 
@@ -339,39 +386,50 @@ INIT_TEST_ENV_OSX=\
 		launchctl limit maxproc || : ; \
 		ulimit -u ${MAX_PROC} || : ; \
 		ulimit -u ; \
-		rm -rf ${OSX_VARDIR}
+		rm -rf ${VARDIR}
 
 test_osx_no_deps: build_osx
+	make LuaJIT-test
 	${INIT_TEST_ENV_OSX}; \
-	cd test && ./test-run.py --vardir ${OSX_VARDIR} --force $(TEST_RUN_EXTRA_PARAMS)
+	cd test && ./test-run.py --vardir ${VARDIR} --force $(TEST_RUN_EXTRA_PARAMS)
+
+# FIXME: Temporary target with reduced number of tests.
+# Use test_osx_no_deps target, when all M1 issues are resolved.
+test_osx_arm64_no_deps: build_osx
+	make PUC-Rio-Lua-5.1-tests lua-Harness-tests tarantool-tests
 
 test_osx: deps_osx test_osx_no_deps
 
 test_osx_github_actions: deps_osx_github_actions test_osx_no_deps
 
+test_osx_arm64_github_actions: deps_osx_github_actions test_osx_arm64_no_deps
+
 # Static macOS build
 
-STATIC_OSX_PKGS_MIN=cmake
-STATIC_OSX_PKGS=${STATIC_OSX_PKGS_MIN} file://$${PWD}/tools/brew_taps/tntpython2.rb
+STATIC_OSX_PKGS=cmake
 base_deps_osx:
 	brew update || echo | /usr/bin/ruby -e \
 		"$$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install)"
 	brew install --force ${STATIC_OSX_PKGS} || brew upgrade ${STATIC_OSX_PKGS}
-	pip install --force-reinstall -r test-run/requirements.txt
+	pip3 install --force-reinstall -r test-run/requirements.txt
 
 base_deps_osx_github_actions:
 	# try to install the packages either upgrade it to avoid of fails
 	# if the package already exists with the previous version
-	brew install --force ${STATIC_OSX_PKGS_MIN} || brew upgrade ${STATIC_OSX_PKGS_MIN}
-	pip install --force-reinstall -r test-run/requirements.txt
+	brew install --force ${STATIC_OSX_PKGS} || brew upgrade ${STATIC_OSX_PKGS}
+	pip3 install --force-reinstall -r test-run/requirements.txt
 
 # builddir used in this target - is a default build path from cmake
 # ExternalProject_Add()
 test_static_build_cmake_osx_no_deps:
+	# due swap disabling should be manualy configured need to
+	# control it's status
+	sysctl vm.swapusage
 	cd static-build && cmake -DCMAKE_TARANTOOL_ARGS="-DCMAKE_BUILD_TYPE=RelWithDebInfo;-DENABLE_WERROR=ON" . && \
 	make -j && ctest -V
+	make -C ${PWD}/static-build/tarantool-prefix/src/tarantool-build LuaJIT-test
 	${INIT_TEST_ENV_OSX}; \
-	cd test && ./test-run.py --vardir ${OSX_VARDIR} \
+	cd test && ./test-run.py --vardir ${VARDIR} \
 		--builddir ${PWD}/static-build/tarantool-prefix/src/tarantool-build \
 		--force $(TEST_RUN_EXTRA_PARAMS)
 
@@ -389,10 +447,12 @@ deps_freebsd:
 		python27 py27-yaml py27-six py27-gevent
 
 build_freebsd:
+	if [ "$$(swapctl -l | wc -l)" != "1" ]; then sudo swapoff -a ; fi ; swapctl -l
 	cmake . -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_WERROR=ON ${CMAKE_EXTRA_PARAMS}
 	gmake -j
 
 test_freebsd_no_deps: build_freebsd
+	make LuaJIT-test
 	cd test && python2.7 test-run.py --force $(TEST_RUN_EXTRA_PARAMS)
 
 test_freebsd: deps_freebsd test_freebsd_no_deps
@@ -402,5 +462,9 @@ test_freebsd: deps_freebsd test_freebsd_no_deps
 # ###################
 
 test_jepsen: deps_debian_jepsen
+	# Jepsen build uses git commands internally, like command
+	# 'git stash --all' which fails w/o git configuration setup
+	git config --get user.name || git config --global user.name "Nodody User"
+	git config --get user.email || git config --global user.email "nobody@nowhere.com"
 	cmake . -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_WERROR=ON -DWITH_JEPSEN=ON
 	make run-jepsen

@@ -27,7 +27,7 @@ test:execsql [[
     CREATE TABLE t1(x int primary key, y int);
     START TRANSACTION;
 ]]
-local i, j
+local j
 for i = 1, 31, 1 do
     j = 0
     while math.pow(2, j) < i do
@@ -198,7 +198,7 @@ test:do_execsql_test(
 
 -- Some tests for queries with a GROUP BY clause but no aggregate functions.
 --
--- Note: The query in test cases 5.1 through 5.5 are not legal SQL. So if the 
+-- Note: The query in test cases 5.1 through 5.5 are not legal SQL. So if the
 -- implementation changes in the future and it returns different results,
 -- this is not such a big deal.
 --
@@ -213,7 +213,7 @@ test:do_execsql_test(
         CREATE INDEX t2_idx ON t2(a);
     ]], {
         -- <select5-5.1>
-        
+
         -- </select5-5.1>
     })
 
@@ -384,7 +384,7 @@ test:do_execsql_test(
 test:do_execsql_test(
     "select5-8.6",
     [[
-        SELECT a, count(t8a.b) FROM t8a, t8b WHERE b=t8b.rowid 
+        SELECT a, count(t8a.b) FROM t8a, t8b WHERE b=t8b.rowid
          GROUP BY a ORDER BY 2;
     ]], {
         -- <select5-8.6>
@@ -558,7 +558,7 @@ test:do_catchsql_test(
             SELECT 1 FROM jj HAVING avg(s2) = 1 AND avg(s2) = 0;
     ]], {
     -- <select5-9.13.2>
-    1, "Type mismatch: can not convert A to number"
+    1, "Type mismatch: can not convert string('A') to number"
     -- </select5-9.13.2>
 })
 

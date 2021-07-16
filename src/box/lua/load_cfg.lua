@@ -42,7 +42,9 @@ local default_cfg = {
     strip_core          = true,
     memtx_min_tuple_size = 16,
     memtx_max_tuple_size = 1024 * 1024,
+    slab_alloc_granularity = 8,
     slab_alloc_factor   = 1.05,
+    iproto_threads      = 1,
     work_dir            = nil,
     memtx_dir           = ".",
     wal_dir             = ".",
@@ -71,6 +73,8 @@ local default_cfg = {
     wal_mode            = "write",
     wal_max_size        = 256 * 1024 * 1024,
     wal_dir_rescan_delay= 2,
+    wal_queue_max_size  = 16 * 1024 * 1024,
+    wal_cleanup_delay   = 4 * 3600,
     force_recovery      = false,
     replication         = nil,
     instance_uuid       = nil,
@@ -115,15 +119,37 @@ local module_cfg = {
     log_format          = log.box_api,
 }
 
+-- cfg types for modules, probably better to
+-- provide some API with type enumeration or
+-- similar. Currently it has use for environment
+-- processing only.
+--
+-- get_option_from_env() leans on the set of types
+-- in use: don't forget to update it when add a new
+-- type or a combination of types here.
+local module_cfg_type = {
+    -- logging
+    log                 = 'string',
+    log_nonblock        = 'boolean',
+    log_level           = 'number, string',
+    log_format          = 'string',
+}
+
 -- types of available options
 -- could be comma separated lua types or 'any' if any type is allowed
+--
+-- get_option_from_env() leans on the set of types in use: don't
+-- forget to update it when add a new type or a combination of
+-- types here.
 local template_cfg = {
     listen              = 'string, number',
     memtx_memory        = 'number',
     strip_core          = 'boolean',
     memtx_min_tuple_size  = 'number',
     memtx_max_tuple_size  = 'number',
+    slab_alloc_granularity = 'number',
     slab_alloc_factor   = 'number',
+    iproto_threads      = 'number',
     work_dir            = 'string',
     memtx_dir            = 'string',
     wal_dir             = 'string',
@@ -152,6 +178,7 @@ local template_cfg = {
     wal_mode            = 'string',
     wal_max_size        = 'number',
     wal_dir_rescan_delay= 'number',
+    wal_cleanup_delay   = 'number',
     force_recovery      = 'boolean',
     replication         = 'string, number, table',
     instance_uuid       = 'string',
@@ -163,6 +190,7 @@ local template_cfg = {
     coredump            = 'boolean',
     checkpoint_interval = 'number',
     checkpoint_wal_threshold = 'number',
+    wal_queue_max_size  = 'number',
     checkpoint_count    = 'number',
     read_only           = 'boolean',
     hot_standby         = 'boolean',
@@ -277,6 +305,7 @@ local dynamic_cfg = {
     checkpoint_count        = private.cfg_set_checkpoint_count,
     checkpoint_interval     = private.cfg_set_checkpoint_interval,
     checkpoint_wal_threshold = private.cfg_set_checkpoint_wal_threshold,
+    wal_queue_max_size      = private.cfg_set_wal_queue_max_size,
     worker_pool_threads     = private.cfg_set_worker_pool_threads,
     feedback_enabled        = ifdef_feedback_set_params,
     feedback_crashinfo      = ifdef_feedback_set_params,
@@ -284,6 +313,7 @@ local dynamic_cfg = {
     feedback_interval       = ifdef_feedback_set_params,
     -- do nothing, affects new replicas, which query this value on start
     wal_dir_rescan_delay    = function() end,
+    wal_cleanup_delay       = private.cfg_set_wal_cleanup_delay,
     custom_proc_title       = function()
         require('title').update(box.cfg.custom_proc_title)
     end,
@@ -344,6 +374,8 @@ local dynamic_cfg_order = {
     -- the new one. This should be fixed when box.cfg is able to
     -- apply some parameters together and atomically.
     replication_anon        = 250,
+    -- Cleanup delay should be ignored if replication_anon is set.
+    wal_cleanup_delay       = 260,
     election_mode           = 300,
     election_timeout        = 320,
 }
@@ -515,6 +547,18 @@ local function prepare_cfg(cfg, default_cfg, template_cfg,
     return new_cfg
 end
 
+-- Transfer options from env_cfg to cfg.
+local function apply_env_cfg(cfg, env_cfg)
+    -- Add options passed through environment variables.
+    -- Here we only add options without overloading the ones set
+    -- by the user.
+    for k, v in pairs(env_cfg) do
+        if cfg[k] == nil then
+            cfg[k] = v
+        end
+    end
+end
+
 local function apply_default_cfg(cfg, default_cfg, module_cfg)
     for k,v in pairs(default_cfg) do
         if cfg[k] == nil then
@@ -587,6 +631,7 @@ local box_cfg_guard_whitelist = {
     error = true;
     internal = true;
     index = true;
+    lib = true;
     session = true;
     tuple = true;
     runtime = true;
@@ -636,6 +681,10 @@ local function load_cfg(cfg)
     end
 
     cfg = upgrade_cfg(cfg, translate_cfg)
+
+    -- Set options passed through environment variables.
+    apply_env_cfg(cfg, box.internal.cfg.env)
+
     cfg = prepare_cfg(cfg, default_cfg, template_cfg,
                       module_cfg, modify_cfg)
     apply_default_cfg(cfg, default_cfg, module_cfg);
@@ -756,6 +805,81 @@ box_load_and_execute = function(...)
     return box.execute(...)
 end
 box.execute = box_load_and_execute
+
+--
+-- Parse TT_* environment variable that corresponds to given
+-- option.
+--
+local function get_option_from_env(option)
+    local param_type = template_cfg[option]
+    assert(type(param_type) == 'string')
+
+    if param_type == 'module' then
+        -- Parameter from module.
+        param_type = module_cfg_type[option]
+    end
+
+    local env_var_name = 'TT_' .. option:upper()
+    local raw_value = os.getenv(env_var_name)
+
+    if raw_value == nil or raw_value == '' then
+        return nil
+    end
+
+    local err_msg_fmt = 'Environment variable %s has ' ..
+        'incorrect value for option "%s": should be %s'
+
+    -- This code lean on the existing set of template_cfg and
+    -- module_cfg_type types for simplicity.
+    if param_type:find('table') and raw_value:find(',') then
+        assert(not param_type:find('boolean'))
+        local res = {}
+        for i, v in ipairs(raw_value:split(',')) do
+            res[i] = tonumber(v) or v
+        end
+        return res
+    elseif param_type:find('boolean') then
+        assert(param_type == 'boolean')
+        if raw_value:lower() == 'false' then
+            return false
+        elseif raw_value:lower() == 'true' then
+            return true
+        end
+        error(err_msg_fmt:format(env_var_name, option, '"true" or "false"'))
+    elseif param_type == 'number' then
+        local res = tonumber(raw_value)
+        if res == nil then
+            error(err_msg_fmt:format(env_var_name, option,
+                'convertible to a number'))
+        end
+        return res
+    elseif param_type:find('number') then
+        assert(not param_type:find('boolean'))
+        return tonumber(raw_value) or raw_value
+    else
+        assert(param_type == 'string')
+        return raw_value
+    end
+end
+
+--
+-- Read box configuration from environment variables.
+--
+box.internal.cfg = setmetatable({}, {
+    __index = function(self, key)
+        if key == 'env' then
+            local res = {}
+            for option, _ in pairs(template_cfg) do
+                res[option] = get_option_from_env(option)
+            end
+            return res
+        end
+        assert(false)
+    end,
+    __newindex = function(self, key, value) -- luacheck: no unused args
+        error('Attempt to modify a read-only table')
+    end,
+})
 
 -- gh-810:
 -- hack luajit default cpath

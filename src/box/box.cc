@@ -83,12 +83,19 @@
 #include "raft.h"
 #include "trivia/util.h"
 
+enum {
+	IPROTO_THREADS_MAX = 1000,
+};
+
 static char status[64] = "unknown";
 
 /** box.stat rmean */
 struct rmean *rmean_box;
 
-struct rlist box_on_shutdown = RLIST_HEAD_INITIALIZER(box_on_shutdown);
+double on_shutdown_trigger_timeout = 3.0;
+
+struct rlist box_on_shutdown_trigger_list =
+	RLIST_HEAD_INITIALIZER(box_on_shutdown_trigger_list);
 
 static void title(const char *new_status)
 {
@@ -122,8 +129,6 @@ static struct gc_checkpoint_ref backup_gc;
 static bool is_box_configured = false;
 static bool is_ro = true;
 static fiber_cond ro_cond;
-/** Set to true during recovery from local files. */
-static bool is_local_recovery = false;
 
 /**
  * The following flag is set if the instance failed to
@@ -215,7 +220,7 @@ box_process_rw(struct request *request, struct space *space,
 	rmean_collect(rmean_box, request->type, 1);
 	if (access_check_space(space, PRIV_W) != 0)
 		goto rollback;
-	if (txn_begin_stmt(txn, space) != 0)
+	if (txn_begin_stmt(txn, space, request->type) != 0)
 		goto rollback;
 	if (space_execute_dml(space, txn, request, &tuple) != 0) {
 		txn_rollback_stmt(txn);
@@ -238,24 +243,7 @@ box_process_rw(struct request *request, struct space *space,
 		goto rollback;
 
 	if (is_autocommit) {
-		int res = 0;
-		/*
-		 * During local recovery the commit procedure
-		 * should be async, otherwise the only fiber
-		 * processing recovery will get stuck on the first
-		 * synchronous tx it meets until confirm timeout
-		 * is reached and the tx is rolled back, yielding
-		 * an error.
-		 * Moreover, txn_commit_async() doesn't hurt at
-		 * all during local recovery, since journal_write
-		 * is faked at this stage and returns immediately.
-		 */
-		if (is_local_recovery) {
-			res = txn_commit_async(txn);
-		} else {
-			res = txn_commit(txn);
-		}
-		if (res < 0)
+		if (txn_commit(txn) < 0)
 			goto error;
 	        fiber_gc();
 	}
@@ -267,7 +255,7 @@ box_process_rw(struct request *request, struct space *space,
 
 rollback:
 	if (is_autocommit) {
-		txn_rollback(txn);
+		txn_abort(txn);
 		fiber_gc();
 	}
 error:
@@ -331,9 +319,26 @@ box_set_orphan(bool orphan)
 }
 
 struct wal_stream {
+	/** Base class. */
 	struct xstream base;
-	/** How many rows have been recovered so far. */
-	size_t rows;
+	/** Current transaction ID. 0 when no transaction. */
+	int64_t tsn;
+	/**
+	 * LSN of the first row saved to check TSN and LSN match in case all
+	 * rows of the tx appeared to be local.
+	 */
+	int64_t first_row_lsn;
+	/**
+	 * Flag whether there is a pending yield to do when the current
+	 * transaction is finished. It can't always be done right away because
+	 * would abort the current transaction if it is memtx.
+	 */
+	bool has_yield;
+	/**
+	 * True if any row in the transaction was global. Saved to check if TSN
+	 * matches LSN of a first global row.
+	 */
+	bool has_global_row;
 };
 
 /**
@@ -376,48 +381,247 @@ recovery_journal_create(struct vclock *v)
 	journal_set(&journal.base);
 }
 
+/**
+ * Drop the stream to the initial state. It is supposed to be done when an error
+ * happens. Because in case of force recovery the stream will continue getting
+ * tuples. For that it must stay in a valid state and must handle them somehow.
+ *
+ * Now the stream simply drops the current transaction like it never happened,
+ * even if its commit-row wasn't met yet. Should be good enough for
+ * force-recovery when the consistency is already out of the game.
+ */
 static void
-apply_wal_row(struct xstream *stream, struct xrow_header *row)
+wal_stream_abort(struct wal_stream *stream)
+{
+	struct txn *tx = in_txn();
+	if (tx != NULL)
+		txn_abort(tx);
+	stream->tsn = 0;
+	fiber_gc();
+}
+
+/**
+ * The wrapper exists only for the debug purposes, to ensure tsn being non-0 is
+ * in sync with the fiber's txn being non-NULL. It has nothing to do with the
+ * journal content, and therefore can use assertions instead of rigorous error
+ * checking even in release.
+ */
+static bool
+wal_stream_has_tx(const struct wal_stream *stream)
+{
+	bool has = stream->tsn != 0;
+	assert(has == (in_txn() != NULL));
+	return has;
+}
+
+static int
+wal_stream_apply_synchro_row(struct wal_stream *stream, struct xrow_header *row)
+{
+	assert(iproto_type_is_synchro_request(row->type));
+	if (wal_stream_has_tx(stream)) {
+		diag_set(XlogError, "found synchro request in a transaction");
+		return -1;
+	}
+	struct synchro_request syn_req;
+	if (xrow_decode_synchro(row, &syn_req) != 0) {
+		say_error("couldn't decode a synchro request");
+		return -1;
+	}
+	txn_limbo_process(&txn_limbo, &syn_req);
+	return 0;
+}
+
+static int
+wal_stream_apply_raft_row(struct wal_stream *stream, struct xrow_header *row)
+{
+	assert(iproto_type_is_raft_request(row->type));
+	if (wal_stream_has_tx(stream)) {
+		diag_set(XlogError, "found raft request in a transaction");
+		return -1;
+	}
+	struct raft_request raft_req;
+	/* Vclock is never persisted in WAL by Raft. */
+	if (xrow_decode_raft(row, &raft_req, NULL) != 0) {
+		say_error("couldn't decode a raft request");
+		return -1;
+	}
+	box_raft_recover(&raft_req);
+	return 0;
+}
+
+/**
+ * Rows of the same transaction are wrapped into begin/commit. Mostly for the
+ * sake of synchronous replication, when the log can contain rolled back
+ * transactions, which must be entirely reverted during recovery when ROLLBACK
+ * records are met. Row-by-row recovery wouldn't work for multi-statement
+ * synchronous transactions.
+ */
+static int
+wal_stream_apply_dml_row(struct wal_stream *stream, struct xrow_header *row)
 {
 	struct request request;
-	if (iproto_type_is_synchro_request(row->type)) {
-		struct synchro_request syn_req;
-		if (xrow_decode_synchro(row, &syn_req) != 0)
-			diag_raise();
-		txn_limbo_process(&txn_limbo, &syn_req);
-		return;
+	uint64_t req_type = dml_request_key_map(row->type);
+	if (xrow_decode_dml(row, &request, req_type) != 0) {
+		say_error("couldn't decode a DML request");
+		return -1;
 	}
-	if (iproto_type_is_raft_request(row->type)) {
-		struct raft_request raft_req;
-		/* Vclock is never persisted in WAL by Raft. */
-		if (xrow_decode_raft(row, &raft_req, NULL) != 0)
-			diag_raise();
-		box_raft_recover(&raft_req);
-		return;
+	/*
+	 * Note that all the information which came from the log is validated
+	 * and the errors are handled. Not asserted or paniced. That is for the
+	 * sake of force recovery, which must be able to recover just everything
+	 * what possible instead of terminating the instance.
+	 */
+	struct txn *txn;
+	if (stream->tsn == 0) {
+		if (row->tsn == 0) {
+			diag_set(XlogError, "found a row without TSN");
+			goto end_diag_request;
+		}
+		stream->tsn = row->tsn;
+		stream->first_row_lsn = row->lsn;
+		stream->has_global_row = false;
+		/*
+		 * Rows are not stacked into a list like during replication,
+		 * because recovery does not yield while reading the rows. All
+		 * the yields are controlled by the stream, and therefore no
+		 * need to wait for all the rows to start a transaction. Can
+		 * start now, apply the rows, and make a yield after commit if
+		 * necessary. Helps to avoid a lot of copying.
+		 */
+		txn = txn_begin();
+		if (txn == NULL) {
+			say_error("couldn't begin a recovery transaction");
+			return -1;
+		}
+	} else if (row->tsn != stream->tsn) {
+		diag_set(XlogError, "found a next transaction with the "
+			 "previous one not yet committed");
+		goto end_diag_request;
+	} else {
+		txn = in_txn();
 	}
-	xrow_decode_dml_xc(row, &request, dml_request_key_map(row->type));
+	/* Ensure TSN is equal to LSN of the first global row. */
+	if (!stream->has_global_row && row->group_id != GROUP_LOCAL) {
+		if (row->tsn != row->lsn) {
+			diag_set(XlogError, "found a first global row in a "
+				 "transaction with LSN/TSN mismatch");
+			goto end_diag_request;
+		}
+		stream->has_global_row = true;
+	}
+	assert(wal_stream_has_tx(stream));
+	/* Nops might appear at least after before_replace skipping rows. */
 	if (request.type != IPROTO_NOP) {
-		struct space *space = space_cache_find_xc(request.space_id);
+		struct space *space = space_cache_find(request.space_id);
+		if (space == NULL) {
+			say_error("couldn't find space by ID");
+			goto end_diag_request;
+		}
 		if (box_process_rw(&request, space, NULL) != 0) {
-			say_error("error applying row: %s", request_str(&request));
-			diag_raise();
+			say_error("couldn't apply the request");
+			goto end_diag_request;
 		}
 	}
-	struct wal_stream *xstream =
-		container_of(stream, struct wal_stream, base);
-	/**
-	 * Yield once in a while, but not too often,
-	 * mostly to allow signal handling to take place.
+	assert(txn != NULL);
+	if (!row->is_commit)
+		return 0;
+	/*
+	 * For fully local transactions the TSN check won't work like for global
+	 * transactions, because it is not known if there are global rows until
+	 * commit arrives.
 	 */
-	if (++xstream->rows % WAL_ROWS_PER_YIELD == 0)
-		fiber_sleep(0);
+	if (!stream->has_global_row && stream->tsn != stream->first_row_lsn) {
+		diag_set(XlogError, "fully local transaction's TSN does not "
+			 "match LSN of the first row");
+		return -1;
+	}
+	stream->tsn = 0;
+	/*
+	 * During local recovery the commit procedure should be async, otherwise
+	 * the only fiber processing recovery will get stuck on the first
+	 * synchronous tx it meets until confirm timeout is reached and the tx
+	 * is rolled back, yielding an error.
+	 * Moreover, txn_commit_try_async() doesn't hurt at all during local
+	 * recovery, since journal_write is faked at this stage and returns
+	 * immediately.
+	 */
+	if (txn_commit_try_async(txn) != 0) {
+		/* Commit fail automatically leads to rollback. */
+		assert(in_txn() == NULL);
+		say_error("couldn't commit a recovery transaction");
+		return -1;
+	}
+	assert(in_txn() == NULL);
+	fiber_gc();
+	return 0;
+
+end_diag_request:
+	/*
+	 * The label must be used only for the errors related directly to the
+	 * request. Errors like txn_begin() fail has nothing to do with it, and
+	 * therefore don't log the request as the fault reason.
+	 */
+	say_error("error at request: %s", request_str(&request));
+	return -1;
+}
+
+/**
+ * Yield once in a while, but not too often, mostly to allow signal handling to
+ * take place.
+ */
+static void
+wal_stream_try_yield(struct wal_stream *stream)
+{
+	if (wal_stream_has_tx(stream) || !stream->has_yield)
+		return;
+	stream->has_yield = false;
+	fiber_sleep(0);
+}
+
+static void
+wal_stream_apply_row(struct xstream *base, struct xrow_header *row)
+{
+	struct wal_stream *stream =
+		container_of(base, struct wal_stream, base);
+	if (iproto_type_is_synchro_request(row->type)) {
+		if (wal_stream_apply_synchro_row(stream, row) != 0)
+			goto end_error;
+	} else if (iproto_type_is_raft_request(row->type)) {
+		if (wal_stream_apply_raft_row(stream, row) != 0)
+			goto end_error;
+	} else if (wal_stream_apply_dml_row(stream, row) != 0) {
+		goto end_error;
+	}
+	wal_stream_try_yield(stream);
+	return;
+
+end_error:
+	wal_stream_abort(stream);
+	wal_stream_try_yield(stream);
+	diag_raise();
+}
+
+/**
+ * Plan a yield in recovery stream. Wal stream will execute it as soon as it's
+ * ready.
+ */
+static void
+wal_stream_schedule_yield(struct xstream *base)
+{
+	struct wal_stream *stream = container_of(base, struct wal_stream, base);
+	stream->has_yield = true;
+	wal_stream_try_yield(stream);
 }
 
 static void
 wal_stream_create(struct wal_stream *ctx)
 {
-	xstream_create(&ctx->base, apply_wal_row);
-	ctx->rows = 0;
+	xstream_create(&ctx->base, wal_stream_apply_row,
+		       wal_stream_schedule_yield);
+	ctx->tsn = 0;
+	ctx->first_row_lsn = 0;
+	ctx->has_yield = false;
+	ctx->has_global_row = false;
 }
 
 /* {{{ configuration bindings */
@@ -461,31 +665,43 @@ box_check_say(void)
 	}
 }
 
-static void
+static int
 box_check_uri(const char *source, const char *option_name)
 {
 	if (source == NULL)
-		return;
+		return 0;
 	struct uri uri;
 
 	/* URI format is [host:]service */
 	if (uri_parse(&uri, source) || !uri.service) {
-		tnt_raise(ClientError, ER_CFG, option_name,
-			  "expected host:service or /unix.socket");
+		diag_set(ClientError, ER_CFG, option_name,
+			 "expected host:service or /unix.socket");
+		return -1;
 	}
+	return 0;
 }
 
-static const char *
+static enum election_mode
 box_check_election_mode(void)
 {
 	const char *mode = cfg_gets("election_mode");
-	if (mode == NULL || (strcmp(mode, "off") != 0 &&
-	    strcmp(mode, "voter") != 0 && strcmp(mode, "candidate") != 0)) {
-		diag_set(ClientError, ER_CFG, "election_mode", "the value must "
-			 "be a string 'off' or 'voter' or 'candidate'");
-		return NULL;
-	}
-	return mode;
+	if (mode == NULL)
+		goto error;
+
+	if (strcmp(mode, "off") == 0)
+		return ELECTION_MODE_OFF;
+	else if (strcmp(mode, "voter") == 0)
+		return ELECTION_MODE_VOTER;
+	else if (strcmp(mode, "manual") == 0)
+		return ELECTION_MODE_MANUAL;
+	else if (strcmp(mode, "candidate") == 0)
+		return ELECTION_MODE_CANDIDATE;
+
+error:
+	diag_set(ClientError, ER_CFG, "election_mode",
+		"the value must be one of the following strings: "
+		"'off', 'voter', 'candidate', 'manual'");
+	return ELECTION_MODE_INVALID;
 }
 
 static double
@@ -506,7 +722,8 @@ box_check_replication(void)
 	int count = cfg_getarr_size("replication");
 	for (int i = 0; i < count; i++) {
 		const char *source = cfg_getarr_elem("replication", i);
-		box_check_uri(source, "replication");
+		if (box_check_uri(source, "replication") != 0)
+			diag_raise();
 	}
 }
 
@@ -754,6 +971,33 @@ box_check_wal_mode(const char *mode_name)
 	return (enum wal_mode) mode;
 }
 
+static int64_t
+box_check_wal_queue_max_size(void)
+{
+	int64_t size = cfg_geti64("wal_queue_max_size");
+	if (size < 0) {
+		diag_set(ClientError, ER_CFG, "wal_queue_max_size",
+			 "wal_queue_max_size must be >= 0");
+	}
+	/* Unlimited. */
+	if (size == 0)
+		size = INT64_MAX;
+	return size;
+}
+
+static double
+box_check_wal_cleanup_delay(void)
+{
+	double value = cfg_getd("wal_cleanup_delay");
+	if (value < 0) {
+		diag_set(ClientError, ER_CFG, "wal_cleanup_delay",
+			 "value must be >= 0");
+		return -1;
+	}
+
+	return value;
+}
+
 static void
 box_check_readahead(int readahead)
 {
@@ -849,15 +1093,54 @@ box_check_sql_cache_size(int size)
 	return 0;
 }
 
+static void
+box_check_small_alloc_options(void)
+{
+	/*
+	 * If we use the int type, we may get an incorrect
+	 * result if the user enters a large value.
+	 */
+	int64_t granularity = cfg_geti64("slab_alloc_granularity");
+	/*
+	 * Granularity must be exponent of two and >= 4.
+	 * We can use granularity value == 4 only because we used small
+	 * memory allocator only for struct tuple, which doesn't require
+	 * aligment. Also added an upper bound for granularity, since if
+	 * the user enters too large value, he will get incomprehensible
+	 * errors later.
+	 */
+	if (granularity < 4 || granularity > 1024 * 16 ||
+	    ! is_exp_of_two(granularity))
+		tnt_raise(ClientError, ER_CFG, "slab_alloc_granularity",
+			  "must be greater than or equal to 4,"
+			  " less than or equal"
+			  " to 1024 * 16 and exponent of two");
+}
+
+static int
+box_check_iproto_options(void)
+{
+	int iproto_threads = cfg_geti("iproto_threads");
+	if (iproto_threads <= 0 || iproto_threads > IPROTO_THREADS_MAX) {
+		diag_set(ClientError, ER_CFG, "iproto_threads",
+			  tt_sprintf("must be greater than or equal to 0,"
+				     " less than or equal to %d",
+				     IPROTO_THREADS_MAX));
+		return -1;
+	}
+	return 0;
+}
+
 void
 box_check_config(void)
 {
 	struct tt_uuid uuid;
 	box_check_say();
-	box_check_uri(cfg_gets("listen"), "listen");
+	if (box_check_uri(cfg_gets("listen"), "listen") != 0)
+		diag_raise();
 	box_check_instance_uuid(&uuid);
 	box_check_replicaset_uuid(&uuid);
-	if (box_check_election_mode() == NULL)
+	if (box_check_election_mode() == ELECTION_MODE_INVALID)
 		diag_raise();
 	if (box_check_election_timeout() < 0)
 		diag_raise();
@@ -875,10 +1158,17 @@ box_check_config(void)
 	box_check_checkpoint_count(cfg_geti("checkpoint_count"));
 	box_check_wal_max_size(cfg_geti64("wal_max_size"));
 	box_check_wal_mode(cfg_gets("wal_mode"));
+	if (box_check_wal_queue_max_size() < 0)
+		diag_raise();
+	if (box_check_wal_cleanup_delay() < 0)
+		diag_raise();
 	if (box_check_memory_quota("memtx_memory") < 0)
 		diag_raise();
 	box_check_memtx_min_tuple_size(cfg_geti64("memtx_min_tuple_size"));
+	box_check_small_alloc_options();
 	box_check_vinyl_options();
+	if (box_check_iproto_options() != 0)
+		diag_raise();
 	if (box_check_sql_cache_size(cfg_geti("sql_cache_size")) != 0)
 		diag_raise();
 }
@@ -886,11 +1176,12 @@ box_check_config(void)
 int
 box_set_election_mode(void)
 {
-	const char *mode = box_check_election_mode();
-	if (mode == NULL)
+	enum election_mode mode = box_check_election_mode();
+	if (mode == ELECTION_MODE_INVALID)
 		return -1;
-	raft_cfg_is_candidate(box_raft(), strcmp(mode, "candidate") == 0);
-	raft_cfg_is_enabled(box_raft(), strcmp(mode, "off") != 0);
+	box_election_mode = mode;
+	raft_cfg_is_candidate(box_raft(), mode == ELECTION_MODE_CANDIDATE);
+	raft_cfg_is_enabled(box_raft(), mode != ELECTION_MODE_OFF);
 	return 0;
 }
 
@@ -1102,7 +1393,7 @@ box_set_replication_anon(void)
 		 * Wait until the master has registered this
 		 * instance.
 		 */
-		struct replica *master = replicaset_leader();
+		struct replica *master = replicaset_find_join_master();
 		if (master == NULL || master->applier == NULL ||
 		    master->applier->state != APPLIER_CONNECTED) {
 			tnt_raise(ClientError, ER_CANNOT_REGISTER);
@@ -1236,59 +1527,149 @@ box_wait_quorum(uint32_t lead_id, int64_t target_lsn, int quorum,
 }
 
 int
-box_clear_synchro_queue(bool try_wait)
+box_promote(void)
 {
 	/* A guard to block multiple simultaneous function invocations. */
-	static bool in_clear_synchro_queue = false;
-	if (in_clear_synchro_queue) {
-		diag_set(ClientError, ER_UNSUPPORTED, "clear_synchro_queue",
+	static bool in_promote = false;
+	if (in_promote) {
+		diag_set(ClientError, ER_UNSUPPORTED, "box.ctl.promote",
 			 "simultaneous invocations");
 		return -1;
 	}
-	/*
-	 * XXX: we may want to write confirm + rollback even when the limbo is
-	 * empty for the sake of limbo ownership transition.
-	 */
-	if (!is_box_configured || txn_limbo_is_empty(&txn_limbo))
-		return 0;
-	uint32_t former_leader_id = txn_limbo.owner_id;
-	assert(former_leader_id != REPLICA_ID_NIL);
-	if (former_leader_id == instance_id)
-		return 0;
 
-	in_clear_synchro_queue = true;
+	/*
+	 * Do nothing when box isn't configured and when PROMOTE was already
+	 * written for this term (synchronous replication and leader election
+	 * are in sync, and both chose this node as a leader).
+	 */
+	if (!is_box_configured)
+		return 0;
+	bool run_elections = false;
+	bool try_wait = false;
+
+	switch (box_election_mode) {
+	case ELECTION_MODE_OFF:
+		try_wait = true;
+		break;
+	case ELECTION_MODE_VOTER:
+		assert(box_raft()->state == RAFT_STATE_FOLLOWER);
+		diag_set(ClientError, ER_UNSUPPORTED, "election_mode='voter'",
+			 "manual elections");
+		return -1;
+	case ELECTION_MODE_MANUAL:
+		if (box_raft()->state == RAFT_STATE_LEADER)
+			return 0;
+		run_elections = true;
+		break;
+	case ELECTION_MODE_CANDIDATE:
+		/*
+		 * Leader elections are enabled, and this instance is allowed to
+		 * promote only if it's already an elected leader. No manual
+		 * elections.
+		 */
+		if (box_raft()->state != RAFT_STATE_LEADER) {
+			diag_set(ClientError, ER_UNSUPPORTED, "election_mode="
+				 "'candidate'", "manual elections");
+			return -1;
+		}
+		if (txn_limbo_replica_term(&txn_limbo, instance_id) ==
+		    box_raft()->term)
+			return 0;
+
+		break;
+	default:
+		unreachable();
+	}
+
+	uint32_t former_leader_id = txn_limbo.owner_id;
+	int64_t wait_lsn = txn_limbo.confirmed_lsn;
+	int rc = 0;
+	int quorum = replication_synchro_quorum;
+	in_promote = true;
+	auto promote_guard = make_scoped_guard([&] {
+		in_promote = false;
+	});
+
+	if (run_elections) {
+		/*
+		 * Make this instance a candidate and run until some leader, not
+		 * necessarily this instance, emerges.
+		 */
+		raft_start_candidate(box_raft());
+		/*
+		 * Trigger new elections without waiting for an old leader to
+		 * disappear.
+		 */
+		raft_new_term(box_raft());
+		rc = box_raft_wait_leader_found();
+		/*
+		 * Do not reset raft mode if it was changed while running the
+		 * elections.
+		 */
+		if (box_election_mode == ELECTION_MODE_MANUAL)
+			raft_stop_candidate(box_raft(), false);
+		if (rc != 0)
+			return -1;
+		if (!box_raft()->is_enabled) {
+			diag_set(ClientError, ER_RAFT_DISABLED);
+			return -1;
+		}
+		if (box_raft()->state != RAFT_STATE_LEADER) {
+			diag_set(ClientError, ER_INTERFERING_PROMOTE,
+				 box_raft()->leader);
+			return -1;
+		}
+	}
+
+	if (txn_limbo_is_empty(&txn_limbo))
+		goto promote;
 
 	if (try_wait) {
 		/* Wait until pending confirmations/rollbacks reach us. */
 		double timeout = 2 * replication_synchro_timeout;
-		double start_tm = fiber_clock();
-		while (!txn_limbo_is_empty(&txn_limbo)) {
-			if (fiber_clock() - start_tm > timeout)
-				break;
-			fiber_sleep(0.001);
-		}
+		txn_limbo_wait_empty(&txn_limbo, timeout);
 		/*
 		 * Our mission was to clear the limbo from former leader's
 		 * transactions. Exit in case someone did that for us.
 		 */
-		if (txn_limbo_is_empty(&txn_limbo) ||
-		    former_leader_id != txn_limbo.owner_id) {
-			in_clear_synchro_queue = false;
-			return 0;
+		if (former_leader_id != txn_limbo.owner_id) {
+			diag_set(ClientError, ER_INTERFERING_PROMOTE,
+				 txn_limbo.owner_id);
+			return -1;
+		}
+		if (txn_limbo_is_empty(&txn_limbo)) {
+			wait_lsn = txn_limbo.confirmed_lsn;
+			goto promote;
 		}
 	}
 
-	/*
-	 * clear_synchro_queue() is a no-op on the limbo owner, so all the rows
-	 * in the limbo must've come through the applier meaning they already
-	 * have an lsn assigned, even if their WAL write hasn't finished yet.
-	 */
-	int64_t wait_lsn = txn_limbo_last_synchro_entry(&txn_limbo)->lsn;
+	struct txn_limbo_entry *last_entry;
+	last_entry = txn_limbo_last_synchro_entry(&txn_limbo);
+	/* Wait for the last entries WAL write. */
+	if (last_entry->lsn < 0) {
+		int64_t tid = last_entry->txn->id;
+		if (wal_sync(NULL) < 0)
+			return -1;
+		if (former_leader_id != txn_limbo.owner_id) {
+			diag_set(ClientError, ER_INTERFERING_PROMOTE,
+				 txn_limbo.owner_id);
+			return -1;
+		}
+		if (txn_limbo_is_empty(&txn_limbo)) {
+			wait_lsn = txn_limbo.confirmed_lsn;
+			goto promote;
+		}
+		if (tid != txn_limbo_last_synchro_entry(&txn_limbo)->txn->id) {
+			diag_set(ClientError, ER_QUORUM_WAIT, quorum,
+				 "new synchronous transactions appeared");
+			return -1;
+		}
+	}
+	wait_lsn = last_entry->lsn;
 	assert(wait_lsn > 0);
 
-	int quorum = replication_synchro_quorum;
-	int rc = box_wait_quorum(former_leader_id, wait_lsn, quorum,
-				 replication_synchro_timeout);
+	rc = box_wait_quorum(former_leader_id, wait_lsn, quorum,
+			     replication_synchro_timeout);
 	if (rc == 0) {
 		if (quorum < replication_synchro_quorum) {
 			diag_set(ClientError, ER_QUORUM_WAIT, quorum,
@@ -1299,20 +1680,32 @@ box_clear_synchro_queue(bool try_wait)
 				 "new synchronous transactions appeared");
 			rc = -1;
 		} else {
-			txn_limbo_force_empty(&txn_limbo, wait_lsn);
+promote:
+			/* We cannot possibly get here in a volatile state. */
+			assert(box_raft()->volatile_term == box_raft()->term);
+			txn_limbo_write_promote(&txn_limbo, wait_lsn,
+						box_raft()->term);
+			struct synchro_request req = {
+				.type = IPROTO_PROMOTE,
+				.replica_id = former_leader_id,
+				.origin_id = instance_id,
+				.lsn = wait_lsn,
+				.term = box_raft()->term,
+			};
+			txn_limbo_process(&txn_limbo, &req);
 			assert(txn_limbo_is_empty(&txn_limbo));
 		}
 	}
-	in_clear_synchro_queue = false;
 	return rc;
 }
 
-void
+int
 box_listen(void)
 {
 	const char *uri = cfg_gets("listen");
-	box_check_uri(uri, "listen");
-	iproto_listen(uri);
+	if (box_check_uri(uri, "listen") != 0 || iproto_listen(uri) != 0)
+		return -1;
+	return 0;
 }
 
 void
@@ -1409,6 +1802,33 @@ box_set_checkpoint_wal_threshold(void)
 {
 	int64_t threshold = cfg_geti64("checkpoint_wal_threshold");
 	wal_set_checkpoint_threshold(threshold);
+}
+
+int
+box_set_wal_queue_max_size(void)
+{
+	int64_t size = box_check_wal_queue_max_size();
+	if (size < 0)
+		return -1;
+	wal_set_queue_max_size(size);
+	return 0;
+}
+
+int
+box_set_wal_cleanup_delay(void)
+{
+	double delay = box_check_wal_cleanup_delay();
+	if (delay < 0)
+		return -1;
+	/*
+	 * Anonymous replicas do not require
+	 * delay since they can't be a source
+	 * of replication.
+	 */
+	if (replication_anon)
+		delay = 0;
+	gc_set_wal_cleanup_delay(delay);
+	return 0;
 }
 
 void
@@ -2073,8 +2493,8 @@ box_process_register(struct ev_io *io, struct xrow_header *header)
 	assert(header->type == IPROTO_REGISTER);
 
 	struct tt_uuid instance_uuid = uuid_nil;
-	struct vclock vclock;
-	xrow_decode_register_xc(header, &instance_uuid, &vclock);
+	struct vclock replica_vclock;
+	xrow_decode_register_xc(header, &instance_uuid, &replica_vclock);
 
 	if (!is_box_configured)
 		tnt_raise(ClientError, ER_LOADING);
@@ -2100,7 +2520,9 @@ box_process_register(struct ev_io *io, struct xrow_header *header)
 			  "wal_mode = 'none'");
 	}
 
-	struct gc_consumer *gc = gc_consumer_register(&replicaset.vclock,
+	/* @sa box_process_subscribe(). */
+	vclock_reset(&replica_vclock, 0, vclock_get(&replicaset.vclock, 0));
+	struct gc_consumer *gc = gc_consumer_register(&replica_vclock,
 				"replica %s", tt_uuid_str(&instance_uuid));
 	if (gc == NULL)
 		diag_raise();
@@ -2108,11 +2530,6 @@ box_process_register(struct ev_io *io, struct xrow_header *header)
 
 	say_info("registering replica %s at %s",
 		 tt_uuid_str(&instance_uuid), sio_socketname(io->fd));
-
-	/* See box_process_join() */
-	int64_t limbo_rollback_count = txn_limbo.rollback_count;
-	struct vclock start_vclock;
-	vclock_copy(&start_vclock, &replicaset.vclock);
 
 	/**
 	 * Call the server-side hook which stores the replica uuid
@@ -2126,18 +2543,12 @@ box_process_register(struct ev_io *io, struct xrow_header *header)
 	struct vclock stop_vclock;
 	vclock_copy(&stop_vclock, &replicaset.vclock);
 
-	if (txn_limbo.rollback_count != limbo_rollback_count)
-		tnt_raise(ClientError, ER_SYNC_ROLLBACK);
-
-	if (txn_limbo_wait_confirm(&txn_limbo) != 0)
-		diag_raise();
-
 	/*
 	 * Feed replica with WALs in range
-	 * (start_vclock, stop_vclock) so that it gets its
+	 * (replica_vclock, stop_vclock) so that it gets its
 	 * registration.
 	 */
-	relay_final_join(io->fd, header->sync, &start_vclock, &stop_vclock);
+	relay_final_join(io->fd, header->sync, &replica_vclock, &stop_vclock);
 	say_info("final data sent.");
 
 	struct xrow_header row;
@@ -2254,15 +2665,6 @@ box_process_join(struct ev_io *io, struct xrow_header *header)
 		 tt_uuid_str(&instance_uuid), sio_socketname(io->fd));
 
 	/*
-	 * In order to join a replica, master has to make sure it
-	 * doesn't send unconfirmed data. We have to check that
-	 * there are no rolled back transactions between
-	 * start_vclock and stop_vclock, and that the data right
-	 * before stop_vclock is confirmed, before we can proceed
-	 * to final join.
-	 */
-	int64_t limbo_rollback_count = txn_limbo.rollback_count;
-	/*
 	 * Initial stream: feed replica with dirty data from engines.
 	 */
 	struct vclock start_vclock;
@@ -2282,13 +2684,6 @@ box_process_join(struct ev_io *io, struct xrow_header *header)
 	/* Remember master's vclock after the last request */
 	struct vclock stop_vclock;
 	vclock_copy(&stop_vclock, &replicaset.vclock);
-
-	if (txn_limbo.rollback_count != limbo_rollback_count)
-		tnt_raise(ClientError, ER_SYNC_ROLLBACK);
-
-	if (txn_limbo_wait_confirm(&txn_limbo) != 0)
-		diag_raise();
-
 	/* Send end of initial stage data marker */
 	struct xrow_header row;
 	xrow_encode_vclock_xc(&row, &stop_vclock);
@@ -2329,17 +2724,30 @@ box_process_subscribe(struct ev_io *io, struct xrow_header *header)
 		tnt_raise(ClientError, ER_LOADING);
 
 	struct tt_uuid replica_uuid = uuid_nil;
+	struct tt_uuid peer_replicaset_uuid = uuid_nil;
 	struct vclock replica_clock;
 	uint32_t replica_version_id;
 	vclock_create(&replica_clock);
 	bool anon;
 	uint32_t id_filter;
-	xrow_decode_subscribe_xc(header, NULL, &replica_uuid, &replica_clock,
-				 &replica_version_id, &anon, &id_filter);
+	xrow_decode_subscribe_xc(header, &peer_replicaset_uuid, &replica_uuid,
+				 &replica_clock, &replica_version_id, &anon,
+				 &id_filter);
 
 	/* Forbid connection to itself */
 	if (tt_uuid_is_equal(&replica_uuid, &INSTANCE_UUID))
 		tnt_raise(ClientError, ER_CONNECTION_TO_SELF);
+	/*
+	 * The peer should have bootstrapped from somebody since it tries to
+	 * subscribe already. If it belongs to a different replicaset, it won't
+	 * be ever found here, and would try to reconnect thinking its replica
+	 * ID wasn't replicated here yet. Prevent it right away.
+	 */
+	if (!tt_uuid_is_equal(&peer_replicaset_uuid, &REPLICASET_UUID)) {
+		tnt_raise(ClientError, ER_REPLICASET_UUID_MISMATCH,
+			  tt_uuid_str(&REPLICASET_UUID),
+			  tt_uuid_str(&peer_replicaset_uuid));
+	}
 
 	/*
 	 * Do not allow non-anonymous followers for anonymous
@@ -2398,11 +2806,13 @@ box_process_subscribe(struct ev_io *io, struct xrow_header *header)
 	 * the replica how many rows we have in stock for it,
 	 * and identify ourselves with our own replica id.
 	 *
-	 * Tarantool > 2.1.1 master doesn't check that replica
-	 * has the same cluster id. Instead it sends its cluster
-	 * id to replica, and replica checks that its cluster id
-	 * matches master's one. Older versions will just ignore
-	 * the additional field.
+	 * Master not only checks the replica has the same replicaset UUID, but
+	 * also sends the UUID to the replica so both Tarantools could perform
+	 * any checks they want depending on their version and supported
+	 * features.
+	 *
+	 * Older versions not supporting replicaset UUID in the response will
+	 * just ignore the additional field (these are < 2.1.1).
 	 */
 	struct xrow_header row;
 	xrow_encode_subscribe_response_xc(&row, &REPLICASET_UUID, &vclock);
@@ -2470,16 +2880,10 @@ box_process_subscribe(struct ev_io *io, struct xrow_header *header)
 void
 box_process_vote(struct ballot *ballot)
 {
-	ballot->is_ro = cfg_geti("read_only") != 0;
+	ballot->is_ro_cfg = cfg_geti("read_only") != 0;
 	ballot->is_anon = replication_anon;
-	/*
-	 * is_ro is true on initial load and is set to box.cfg.read_only
-	 * after box_cfg() returns, during dynamic box.cfg parameters setting.
-	 * We would like to prefer already bootstrapped instances to the ones
-	 * still bootstrapping and the ones still bootstrapping, but writeable
-	 * to the ones that have box.cfg.read_only = true.
-	 */
-	ballot->is_loading = is_ro;
+	ballot->is_ro = is_ro_summary;
+	ballot->is_booted = is_box_configured;
 	vclock_copy(&ballot->vclock, &replicaset.vclock);
 	vclock_copy(&ballot->gc_vclock, &gc.vclock);
 }
@@ -2512,7 +2916,7 @@ box_free(void)
 		session_free();
 		user_cache_free();
 		schema_free();
-		module_free();
+		schema_module_free();
 		tuple_free();
 		port_free();
 #endif
@@ -2541,6 +2945,7 @@ engine_init()
 				    cfg_getd("memtx_memory"),
 				    cfg_geti("memtx_min_tuple_size"),
 				    cfg_geti("strip_core"),
+				    cfg_geti("slab_alloc_granularity"),
 				    cfg_getd("slab_alloc_factor"));
 	engine_register((struct engine *)memtx);
 	box_set_memtx_max_tuple_size();
@@ -2710,7 +3115,8 @@ bootstrap(const struct tt_uuid *instance_uuid,
 	 * Begin listening on the socket to enable
 	 * master-master replication leader election.
 	 */
-	box_listen();
+	if (box_listen() != 0)
+		diag_raise();
 	/*
 	 * Wait for the cluster to start up.
 	 *
@@ -2723,8 +3129,7 @@ bootstrap(const struct tt_uuid *instance_uuid,
 	 */
 	box_sync_replication(true);
 
-	/* Use the first replica by URI as a bootstrap leader */
-	struct replica *master = replicaset_leader();
+	struct replica *master = replicaset_find_join_master();
 	assert(master == NULL || master->applier != NULL);
 
 	if (master != NULL && !tt_uuid_is_equal(&master->uuid, &INSTANCE_UUID)) {
@@ -2767,9 +3172,13 @@ local_recovery(const struct tt_uuid *instance_uuid,
 
 	struct wal_stream wal_stream;
 	wal_stream_create(&wal_stream);
+	auto stream_guard = make_scoped_guard([&]{
+		wal_stream_abort(&wal_stream);
+	});
 
 	struct recovery *recovery;
-	recovery = recovery_new(wal_dir(), cfg_geti("force_recovery"),
+	bool is_force_recovery = cfg_geti("force_recovery");
+	recovery = recovery_new(wal_dir(), is_force_recovery,
 				checkpoint_vclock);
 
 	/*
@@ -2788,11 +3197,13 @@ local_recovery(const struct tt_uuid *instance_uuid,
 	 * so we must reflect this in replicaset vclock to
 	 * not attempt to apply these rows twice.
 	 */
-	recovery_scan(recovery, &replicaset.vclock, &gc.vclock);
+	recovery_scan(recovery, &replicaset.vclock, &gc.vclock,
+		      &wal_stream.base);
 	say_info("instance vclock %s", vclock_to_string(&replicaset.vclock));
 
 	if (wal_dir_lock >= 0) {
-		box_listen();
+		if (box_listen() != 0)
+			diag_raise();
 		box_sync_replication(false);
 
 		struct replica *master;
@@ -2817,7 +3228,6 @@ local_recovery(const struct tt_uuid *instance_uuid,
 	memtx = (struct memtx_engine *)engine_by_name("memtx");
 	assert(memtx != NULL);
 
-	is_local_recovery = true;
 	recovery_journal_create(&recovery->vclock);
 
 	/*
@@ -2831,6 +3241,14 @@ local_recovery(const struct tt_uuid *instance_uuid,
 
 	engine_begin_final_recovery_xc();
 	recover_remaining_wals(recovery, &wal_stream.base, NULL, false);
+	if (wal_stream_has_tx(&wal_stream)) {
+		diag_set(XlogError, "found a not finished transaction "
+			 "in the log");
+		wal_stream_abort(&wal_stream);
+		if (!is_force_recovery)
+			diag_raise();
+		diag_log();
+	}
 	engine_end_recovery_xc();
 	/*
 	 * Leave hot standby mode, if any, only after
@@ -2850,16 +3268,25 @@ local_recovery(const struct tt_uuid *instance_uuid,
 		}
 		recovery_stop_local(recovery);
 		recover_remaining_wals(recovery, &wal_stream.base, NULL, true);
+		if (wal_stream_has_tx(&wal_stream)) {
+			diag_set(XlogError, "found a not finished transaction "
+				 "in the log in hot standby mode");
+			wal_stream_abort(&wal_stream);
+			if (!is_force_recovery)
+				diag_raise();
+			diag_log();
+		}
 		/*
 		 * Advance replica set vclock to reflect records
 		 * applied in hot standby mode.
 		 */
 		vclock_copy(&replicaset.vclock, &recovery->vclock);
-		box_listen();
+		if (box_listen() != 0)
+			diag_raise();
 		box_sync_replication(false);
 	}
+	stream_guard.is_active = false;
 	recovery_finalize(recovery);
-	is_local_recovery = false;
 
 	/*
 	 * We must enable WAL before finalizing engine recovery,
@@ -2915,7 +3342,7 @@ box_init(void)
 	 */
 	session_init();
 
-	if (module_init() != 0)
+	if (schema_module_init() != 0)
 		diag_raise();
 
 	if (tuple_init(lua_hash) != 0)
@@ -2950,7 +3377,7 @@ box_cfg_xc(void)
 	schema_init();
 	replication_init();
 	port_init();
-	iproto_init();
+	iproto_init(cfg_geti("iproto_threads"));
 	sql_init();
 
 	int64_t wal_max_size = box_check_wal_max_size(cfg_geti64("wal_max_size"));
@@ -3020,6 +3447,15 @@ box_cfg_xc(void)
 			  &is_bootstrap_leader);
 	}
 	fiber_gc();
+
+	/*
+	 * Exclude self from GC delay because we care
+	 * about remote replicas only, still for ref/unref
+	 * balance we do reference self node initially and
+	 * downgrade it to zero when there is no replication
+	 * set at all.
+	 */
+	gc_delay_unref();
 
 	bootstrap_journal_guard.is_active = false;
 	assert(current_journal != &bootstrap_journal);

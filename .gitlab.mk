@@ -103,7 +103,9 @@ vms_start:
 vms_test_%:
 	tar czf - ../tarantool | ssh ${VMS_USER}@127.0.0.1 -p ${VMS_PORT} tar xzf -
 	ssh ${VMS_USER}@127.0.0.1 -p ${VMS_PORT} "/bin/bash -c \
-		'cd tarantool && ${PRESERVE_ENV} ${TRAVIS_MAKE} $(subst vms_,,$@)'"
+		'cd tarantool && ${PRESERVE_ENV} ${TRAVIS_MAKE} $(subst vms_,,$@)'" || \
+		( scp -r -P ${VMS_PORT} ${VMS_USER}@127.0.0.1:tarantool/test/var/artifacts . \
+		; exit 1 )
 
 vms_shutdown:
 	VBoxManage controlvm ${VMS_NAME} poweroff
@@ -126,14 +128,19 @@ deploy_prepare:
 package: deploy_prepare
 	PACKPACK_EXTRA_DOCKER_RUN_PARAMS="--network=host ${PACKPACK_EXTRA_DOCKER_RUN_PARAMS}" ./packpack/packpack
 
-deploy: package
+# found that libcreaterepo_c.so installed in local lib path
+deploy: export LD_LIBRARY_PATH=/usr/local/lib
+
+deploy:
 	echo ${GPG_SECRET_KEY} | base64 -d | gpg --batch --import || true
 	./tools/update_repo.sh -o=${OS} -d=${DIST} \
 		-b="${LIVE_REPO_S3_DIR}/${BUCKET}" build
-	if [ "${CI_COMMIT_TAG}" != "" ]; then \
-		./tools/update_repo.sh -o=${OS} -d=${DIST} \
+	case "${GITHUB_REF}" in                                       \
+	refs/tags/*)                                                  \
+		./tools/update_repo.sh -o=${OS} -d=${DIST}            \
 			-b="${RELEASE_REPO_S3_DIR}/${BUCKET}" build ; \
-	fi
+	        ;;                                                    \
+	esac
 
 source: deploy_prepare
 	TARBALL_COMPRESSOR=gz packpack/packpack tarball

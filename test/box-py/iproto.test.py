@@ -19,7 +19,7 @@ print("""
 #
 """)
 
-# opeing new connection to tarantool/box
+# opening new connection to tarantool/box
 conn = TarantoolConnection(server.iproto.host, server.iproto.port)
 conn.connect()
 s = conn.socket
@@ -50,7 +50,8 @@ def repr_dict(todump):
     for (k, v) in todump.items():
         k_name = key_names.get(k, k)
         d[k_name] = v
-    return repr(d)
+    return repr(sorted(d.items()))
+
 
 def test(header, body):
     # Connect and authenticate
@@ -60,7 +61,7 @@ def test(header, body):
     header = msgpack.dumps(header)
     body = msgpack.dumps(body)
     query = msgpack.dumps(len(header) + len(body)) + header + body
-    # Send raw request using connectred socket
+    # Send raw request using connected socket
     s = c._socket
     try:
         s.send(query)

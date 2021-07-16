@@ -16,7 +16,7 @@ test:plan(1)
 -- This file implements regression tests for sql library.
 --
 -- This file implements tests to verify that
--- ticket [4a03edc4c8c028c93e9269f64fc5e97f632c1166] has been fixed.  
+-- ticket [4a03edc4c8c028c93e9269f64fc5e97f632c1166] has been fixed.
 --
 -- ["set","testdir",[["file","dirname",["argv0"]]]]
 -- ["source",[["testdir"],"\/tester.tcl"]]
@@ -38,7 +38,7 @@ test:do_test(
         ]]
     end, {
         -- <tkt-4a03ed-1.1>
-        1, "Duplicate key exists in unique index 'pk_unnamed_T1_1' in space 'T1'"
+        1, "Duplicate key exists in unique index \"pk_unnamed_T1_1\" in space \"T1\" with old tuple - [1, 1] and new tuple - [1, 2]"
         -- </tkt-4a03ed-1.1>
     })
 

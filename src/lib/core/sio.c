@@ -59,16 +59,17 @@ sio_socketname_to_buffer(int fd, char *buf, int size)
 		return 0;
 	struct sockaddr_storage addr;
 	socklen_t addrlen = sizeof(addr);
-	int rc = getsockname(fd, (struct sockaddr *) &addr, &addrlen);
+	struct sockaddr *base_addr = (struct sockaddr *)&addr;
+	int rc = getsockname(fd, base_addr, &addrlen);
 	if (rc == 0) {
-		SNPRINT(n, snprintf, buf, size, ", aka %s",
-			sio_strfaddr((struct sockaddr *)&addr, addrlen));
+		SNPRINT(n, snprintf, buf, size, ", aka ");
+		SNPRINT(n, sio_addr_snprintf, buf, size, base_addr, addrlen);
 	}
 	addrlen = sizeof(addr);
 	rc = getpeername(fd, (struct sockaddr *) &addr, &addrlen);
 	if (rc == 0) {
-		SNPRINT(n, snprintf, buf, size, ", peer of %s",
-			sio_strfaddr((struct sockaddr *)&addr, addrlen));
+		SNPRINT(n, snprintf, buf, size, ", peer of ");
+		SNPRINT(n, sio_addr_snprintf, buf, size, base_addr, addrlen);
 	}
 	return 0;
 }
@@ -78,7 +79,7 @@ sio_socketname(int fd)
 {
 	/* Preserve errno */
 	int save_errno = errno;
-	int name_size = 2 * SERVICE_NAME_MAXLEN;
+	int name_size = SERVICE_NAME_MAXLEN;
 	char *name = static_alloc(name_size);
 	int rc = sio_socketname_to_buffer(fd, name, name_size);
 	/*
@@ -326,36 +327,41 @@ sio_getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen)
 	return 0;
 }
 
+int
+sio_addr_snprintf(char *buf, size_t size, const struct sockaddr *addr,
+		  socklen_t addrlen)
+{
+	int res;
+	if (addr->sa_family == AF_UNIX) {
+		struct sockaddr_un *u = (struct sockaddr_un *)addr;
+		if (addrlen >= sizeof(*u))
+			res = snprintf(buf, size, "unix/:%s", u->sun_path);
+		else
+			res = snprintf(buf, size, "unix/:(socket)");
+	} else {
+		char host[NI_MAXHOST], serv[NI_MAXSERV];
+		int flags = NI_NUMERICHOST | NI_NUMERICSERV;
+		if (getnameinfo(addr, addrlen, host, sizeof(host), serv,
+				sizeof(serv), flags) != 0)
+			res = snprintf(buf, size, "(host):(port)");
+		else if (addr->sa_family == AF_INET)
+			res = snprintf(buf, size, "%s:%s", host, serv);
+		else
+			res = snprintf(buf, size, "[%s]:%s", host, serv);
+	}
+	assert(res + 1 < SERVICE_NAME_MAXLEN);
+	assert(res >= 0);
+	return res;
+}
+
 const char *
 sio_strfaddr(const struct sockaddr *addr, socklen_t addrlen)
 {
-	switch (addr->sa_family) {
-		case AF_UNIX: {
-			struct sockaddr_un *u = (struct sockaddr_un *) addr;
-			if (addrlen >= sizeof(*u))
-				return tt_sprintf("unix/:%s", u->sun_path);
-			else
-				return tt_sprintf("unix/:(socket)");
-			break;
-		}
-		case AF_INET: {
-			struct sockaddr_in *in = (struct sockaddr_in *) addr;
-			return tt_snprintf(SERVICE_NAME_MAXLEN, "%s:%d",
-					   inet_ntoa(in->sin_addr),
-					   ntohs(in->sin_port));
-		}
-		default: {
-			char host[NI_MAXHOST], serv[NI_MAXSERV];
-			if (getnameinfo(addr, addrlen, host, sizeof(host),
-					serv, sizeof(serv),
-					NI_NUMERICHOST | NI_NUMERICSERV) != 0)
-				return tt_sprintf("(host):(port)");
-
-			return tt_snprintf(NI_MAXHOST + NI_MAXSERV, "[%s]:%s",
-					   host, serv);
-		}
-	}
-	unreachable();
+	int size = SERVICE_NAME_MAXLEN;
+	char *buf = (char *) static_reserve(size);
+	/* +1 for terminating 0. */
+	static_alloc(sio_addr_snprintf(buf, size, addr, addrlen) + 1);
+	return buf;
 }
 
 int

@@ -16,12 +16,10 @@ test:plan(4)
 -- This file implements regression tests for sql library.
 --
 -- This file implements tests to verify that ticket [3a77c9714e] has been
--- fixed.  
+-- fixed.
 -- ["set","testdir",[["file","dirname",["argv0"]]]]
 -- ["source",[["testdir"],"\/tester.tcl"]]
 
-
-local testprefix = "tkt-3a77c9714e"
 test:do_execsql_test(
     1.1,
     [[
@@ -68,9 +66,9 @@ test:do_execsql_test(
     [[
         SELECT
           SrcWord, Beginnings.Title
-          FROM 
+          FROM
             (SELECT 'FACTORING' AS SrcWord UNION SELECT 'SWIMMING' AS SrcWord )
-          LEFT JOIN 
+          LEFT JOIN
             Beginnings
           WHERE Beginnings.Id= (
             SELECT BeginningId FROM (

@@ -18,17 +18,16 @@ test:plan(19)
 --
 -- ["set","testdir",[["file","dirname",["argv0"]]]]
 -- ["source",[["testdir"],"\/tester.tcl"]]
-local testprefix = "tkt-ba7cbfaedc"
 test:do_execsql_test(
     1,
     [[
         CREATE TABLE t1 (id  INT primary key, x INT , y TEXT);
         INSERT INTO t1 VALUES (1, 3, 'a');
-        INSERT INTO t1 VALUES (2, 1, 'a'); 
+        INSERT INTO t1 VALUES (2, 1, 'a');
         INSERT INTO t1 VALUES (3, 2, 'b');
         INSERT INTO t1 VALUES (4, 2, 'a');
         INSERT INTO t1 VALUES (5, 3, 'b');
-        INSERT INTO t1 VALUES (6, 1, 'b'); 
+        INSERT INTO t1 VALUES (6, 1, 'b');
     ]])
 
 test:do_execsql_test(

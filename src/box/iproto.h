@@ -85,15 +85,18 @@ iproto_reset_stat(void);
  * iproto. To be shown in box.info.
  */
 const char *
-iproto_bound_address(void);
+iproto_bound_address(char *buf);
+
+int
+iproto_rmean_foreach(void *cb, void *cb_ctx);
 
 #if defined(__cplusplus)
 } /* extern "C" */
 
 void
-iproto_init(void);
+iproto_init(int threads_count);
 
-void
+int
 iproto_listen(const char *uri);
 
 void

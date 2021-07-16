@@ -49,6 +49,7 @@ enum {
 	XROW_IOVMAX = XROW_HEADER_IOVMAX + XROW_BODY_IOVMAX,
 	XROW_HEADER_LEN_MAX = 52,
 	XROW_BODY_LEN_MAX = 256,
+	XROW_SYNCHRO_BODY_LEN_MAX = 32,
 	IPROTO_HEADER_LEN = 28,
 	/** 7 = sizeof(iproto_body_bin). */
 	IPROTO_SELECT_HEADER_LEN = IPROTO_HEADER_LEN + 7,
@@ -59,7 +60,7 @@ struct region;
 struct xrow_header {
 	/* (!) Please update txn_add_redo() after changing members */
 
-	uint32_t type;
+	uint16_t type;
 	uint32_t replica_id;
 	/**
 	 * Replication group identifier. 0 - replicaset,
@@ -80,14 +81,28 @@ struct xrow_header {
 	 * transaction.
 	 */
 	int64_t tsn;
-	/**
-	 * True for the last row in a multi-statement transaction,
-	 * or single-statement transaction. Is only encoded in the
-	 * write ahead log for multi-statement transactions.
-	 * Single-statement transactions do not encode
-	 * tsn and is_commit flag to save space.
-	 */
-	bool is_commit;
+	/** Transaction meta flags set only in the last transaction row. */
+	union {
+		uint8_t flags;
+		struct {
+			/**
+			 * Is only encoded in the write ahead log for
+			 * multi-statement transactions. Single-statement
+			 * transactions do not encode tsn and is_commit flag to
+			 * save space.
+			 */
+			bool is_commit : 1;
+			/**
+			 * True for any transaction that would enter the limbo
+			 * (not necessarily a synchronous one).
+			 */
+			bool wait_sync : 1;
+			/**
+			 * True for a synchronous transaction.
+			 */
+			bool wait_ack  : 1;
+		};
+	};
 
 	int bodycnt;
 	uint32_t schema_version;
@@ -154,7 +169,7 @@ struct request {
 	/**
 	 * Request type - IPROTO type code
 	 */
-	uint32_t type;
+	uint16_t type;
 	uint32_t space_id;
 	uint32_t index_id;
 	uint32_t offset;
@@ -212,8 +227,11 @@ xrow_encode_dml(const struct request *request, struct region *region,
  * pending synchronous transactions.
  */
 struct synchro_request {
-	/** Operation type - IPROTO_ROLLBACK or IPROTO_CONFIRM. */
-	uint32_t type;
+	/**
+	 * Operation type - either IPROTO_ROLLBACK or IPROTO_CONFIRM or
+	 * IPROTO_PROMOTE
+	 */
+	uint16_t type;
 	/**
 	 * ID of the instance owning the pending transactions.
 	 * Note, it may be not the same instance, who created this
@@ -223,24 +241,24 @@ struct synchro_request {
 	 */
 	uint32_t replica_id;
 	/**
+	 * Id of the instance which has issued this request. Only filled on
+	 * decoding, and left blank when encoding a request.
+	 */
+	uint32_t origin_id;
+	/**
 	 * Operation LSN.
 	 * In case of CONFIRM it means 'confirm all
 	 * transactions with lsn <= this value'.
 	 * In case of ROLLBACK it means 'rollback all transactions
 	 * with lsn >= this value'.
+	 * In case of PROMOTE it means CONFIRM(lsn) + ROLLBACK(lsn+1)
 	 */
 	int64_t lsn;
-};
-
-/** Synchro request xrow's body in MsgPack format. */
-struct PACKED synchro_body_bin {
-	uint8_t m_body;
-	uint8_t k_replica_id;
-	uint8_t m_replica_id;
-	uint32_t v_replica_id;
-	uint8_t k_lsn;
-	uint8_t m_lsn;
-	uint64_t v_lsn;
+	/**
+	 * The new term the instance issuing this request is in. Only used for
+	 * PROMOTE request.
+	 */
+	uint64_t term;
 };
 
 /**
@@ -250,8 +268,7 @@ struct PACKED synchro_body_bin {
  * @param req Request parameters.
  */
 void
-xrow_encode_synchro(struct xrow_header *row,
-		    struct synchro_body_bin *body,
+xrow_encode_synchro(struct xrow_header *row, char *body,
 		    const struct synchro_request *req);
 
 /**
@@ -271,7 +288,7 @@ xrow_decode_synchro(const struct xrow_header *row, struct synchro_request *req);
 struct raft_request {
 	uint64_t term;
 	uint32_t vote;
-	uint32_t state;
+	uint64_t state;
 	const struct vclock *vclock;
 };
 
@@ -349,18 +366,21 @@ xrow_encode_auth(struct xrow_header *row, const char *salt, size_t salt_len,
 
 /** Reply to IPROTO_VOTE request. */
 struct ballot {
-	/** Set if the instance is running in read-only mode. */
-	bool is_ro;
+	/** Set if the instance is configured in read-only mode. */
+	bool is_ro_cfg;
 	/**
 	 * A flag whether the instance is anonymous, not having an
 	 * ID, and not going to request it.
 	 */
 	bool is_anon;
 	/**
-	 * Set if the instance hasn't finished bootstrap or recovery, or
-	 * is syncing with other replicas in the replicaset.
+	 * Set if the instance is not writable due to any reason. Could be
+	 * config read_only=true; being orphan; being a Raft follower; not
+	 * finished recovery/bootstrap; or anything else.
 	 */
-	bool is_loading;
+	bool is_ro;
+	/** Set if the instance has finished its bootstrap/recovery. */
+	bool is_booted;
 	/** Current instance vclock. */
 	struct vclock vclock;
 	/** Oldest vclock available on the instance. */
@@ -563,7 +583,7 @@ xrow_encode_timestamp(struct xrow_header *row, uint32_t replica_id, double tm);
  * @see xrow_header_encode()
  */
 void
-iproto_header_encode(char *data, uint32_t type, uint64_t sync,
+iproto_header_encode(char *data, uint16_t type, uint64_t sync,
 		     uint32_t schema_version, uint32_t body_length);
 
 struct obuf;

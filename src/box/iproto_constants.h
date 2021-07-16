@@ -49,9 +49,14 @@ enum {
 	XLOG_FIXHEADER_SIZE = 19
 };
 
+/** IPROTO_FLAGS bitfield constants. */
 enum {
 	/** Set for the last xrow in a transaction. */
 	IPROTO_FLAG_COMMIT = 0x01,
+	/** Set for the last row of a tx residing in limbo. */
+	IPROTO_FLAG_WAIT_SYNC = 0x02,
+	/** Set for the last row of a synchronous tx. */
+	IPROTO_FLAG_WAIT_ACK = 0x04,
 };
 
 enum iproto_key {
@@ -127,6 +132,18 @@ enum iproto_key {
 	IPROTO_REPLICA_ANON = 0x50,
 	IPROTO_ID_FILTER = 0x51,
 	IPROTO_ERROR = 0x52,
+	/**
+	 * Term. Has the same meaning as IPROTO_RAFT_TERM, but is an iproto
+	 * key, rather than a raft key. Used for PROMOTE request, which needs
+	 * both iproto (e.g. REPLICA_ID) and raft (RAFT_TERM) keys.
+	 */
+	IPROTO_TERM = 0x53,
+	/*
+	 * Be careful to not extend iproto_key values over 0x7f.
+	 * iproto_keys are encoded in msgpack as positive fixnum, which ends at
+	 * 0x7f, and we rely on this in some places by allocating a uint8_t to
+	 * hold a msgpack-encoded key value.
+	 */
 	IPROTO_KEY_MAX
 };
 
@@ -145,11 +162,12 @@ enum iproto_metadata_key {
 };
 
 enum iproto_ballot_key {
-	IPROTO_BALLOT_IS_RO = 0x01,
+	IPROTO_BALLOT_IS_RO_CFG = 0x01,
 	IPROTO_BALLOT_VCLOCK = 0x02,
 	IPROTO_BALLOT_GC_VCLOCK = 0x03,
-	IPROTO_BALLOT_IS_LOADING = 0x04,
+	IPROTO_BALLOT_IS_RO = 0x04,
 	IPROTO_BALLOT_IS_ANON = 0x05,
+	IPROTO_BALLOT_IS_BOOTED = 0x06,
 };
 
 #define bit(c) (1ULL<<IPROTO_##c)
@@ -221,6 +239,8 @@ enum iproto_type {
 	IPROTO_TYPE_STAT_MAX,
 
 	IPROTO_RAFT = 30,
+	/** PROMOTE request. */
+	IPROTO_PROMOTE = 31,
 
 	/** A confirmation message for synchronous transactions. */
 	IPROTO_CONFIRM = 40,
@@ -273,7 +293,7 @@ enum iproto_raft_keys {
  * @param type IPROTO type.
  */
 static inline const char *
-iproto_type_name(uint32_t type)
+iproto_type_name(uint16_t type)
 {
 	/*
 	 * Sic: iptoto_type_strs[IPROTO_NOP] is NULL
@@ -286,6 +306,10 @@ iproto_type_name(uint32_t type)
 		return iproto_type_strs[type];
 
 	switch (type) {
+	case IPROTO_RAFT:
+		return "RAFT";
+	case IPROTO_PROMOTE:
+		return "PROMOTE";
 	case IPROTO_CONFIRM:
 		return "CONFIRM";
 	case IPROTO_ROLLBACK:
@@ -316,7 +340,7 @@ iproto_key_name(enum iproto_key key)
 
 /** A data manipulation request. */
 static inline bool
-iproto_type_is_dml(uint32_t type)
+iproto_type_is_dml(uint16_t type)
 {
 	return (type >= IPROTO_SELECT && type <= IPROTO_DELETE) ||
 		type == IPROTO_UPSERT || type == IPROTO_NOP;
@@ -327,7 +351,7 @@ iproto_type_is_dml(uint32_t type)
  * @param type iproto type.
  */
 static inline uint64_t
-dml_request_key_map(uint32_t type)
+dml_request_key_map(uint16_t type)
 {
 	/** Advanced requests don't have a defined key map. */
 	assert(iproto_type_is_dml(type));
@@ -335,22 +359,30 @@ dml_request_key_map(uint32_t type)
 	return iproto_body_key_map[type];
 }
 
-/** CONFIRM/ROLLBACK entries for synchronous replication. */
+/** Synchronous replication entries: CONFIRM/ROLLBACK/PROMOTE. */
 static inline bool
-iproto_type_is_synchro_request(uint32_t type)
+iproto_type_is_synchro_request(uint16_t type)
 {
-	return type == IPROTO_CONFIRM || type == IPROTO_ROLLBACK;
+	return type == IPROTO_CONFIRM || type == IPROTO_ROLLBACK ||
+	       type == IPROTO_PROMOTE;
+}
+
+/** PROMOTE entry (synchronous replication and leader elections). */
+static inline bool
+iproto_type_is_promote_request(uint32_t type)
+{
+       return type == IPROTO_PROMOTE;
 }
 
 static inline bool
-iproto_type_is_raft_request(uint32_t type)
+iproto_type_is_raft_request(uint16_t type)
 {
 	return type == IPROTO_RAFT;
 }
 
 /** This is an error. */
 static inline bool
-iproto_type_is_error(uint32_t type)
+iproto_type_is_error(uint16_t type)
 {
 	return (type & IPROTO_TYPE_ERROR) != 0;
 }

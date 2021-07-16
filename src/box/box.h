@@ -64,8 +64,11 @@ struct vclock;
  */
 extern const struct vclock *box_vclock;
 
+/** Time to wait for shutdown triggers finished */
+extern double on_shutdown_trigger_timeout;
+
 /** Invoked on box shutdown. */
-extern struct rlist box_on_shutdown;
+extern struct rlist box_on_shutdown_trigger_list;
 
 /*
  * Initialize box library
@@ -228,7 +231,7 @@ box_process_vote(struct ballot *ballot);
 void
 box_check_config(void);
 
-void box_listen(void);
+int box_listen(void);
 void box_set_replication(void);
 void box_set_log_level(void);
 void box_set_log_format(void);
@@ -239,6 +242,8 @@ void box_set_readahead(void);
 void box_set_checkpoint_count(void);
 void box_set_checkpoint_interval(void);
 void box_set_checkpoint_wal_threshold(void);
+int box_set_wal_queue_max_size(void);
+int box_set_wal_cleanup_delay(void);
 void box_set_memtx_memory(void);
 void box_set_memtx_max_tuple_size(void);
 void box_set_vinyl_memory(void);
@@ -269,7 +274,7 @@ extern "C" {
 typedef struct tuple box_tuple_t;
 
 int
-box_clear_synchro_queue(bool try_wait);
+box_promote(void);
 
 /* box_select is private and used only by FFI */
 API_EXPORT int

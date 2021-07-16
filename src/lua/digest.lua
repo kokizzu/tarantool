@@ -3,7 +3,9 @@
 local ffi = require('ffi')
 local crypto = require('crypto')
 local bit = require('bit')
-local static_alloc = require('buffer').static_alloc
+local buffer = require('buffer')
+local cord_ibuf_take = buffer.internal.cord_ibuf_take
+local cord_ibuf_put = buffer.internal.cord_ibuf_put
 
 ffi.cdef[[
     /* internal implementation */
@@ -29,7 +31,53 @@ ffi.cdef[[
     void PMurHash32_Process(uint32_t *ph1, uint32_t *pcarry, const void *key, int len);
     uint32_t PMurHash32_Result(uint32_t h1, uint32_t carry, uint32_t total_length);
     uint32_t PMurHash32(uint32_t seed, const void *key, int len);
+
+    /* from third_party/zstd/lib/common/xxhash.c */
+    typedef enum { XXH_OK=0, XXH_ERROR } XXH_errorcode;
+    struct XXH32_state_s {
+        unsigned total_len_32;
+        unsigned large_len;
+        unsigned v1;
+        unsigned v2;
+        unsigned v3;
+        unsigned v4;
+        unsigned mem32[4];   /* buffer defined as U32 for alignment */
+        unsigned memsize;
+        unsigned reserved;   /* never read nor write, will be removed in a future version */
+    };
+
+    struct XXH64_state_s {
+        unsigned long long total_len;
+        unsigned long long v1;
+        unsigned long long v2;
+        unsigned long long v3;
+        unsigned long long v4;
+        unsigned long long mem64[4];   /* buffer defined as U64 for alignment */
+        unsigned memsize;
+        unsigned reserved[2];          /* never read nor write, will be removed in a future version */
+    };
+
+    typedef unsigned int       XXH32_hash_t;
+    typedef unsigned long long XXH64_hash_t;
+    XXH32_hash_t tnt_XXH32 (const void* input, size_t length, unsigned int seed);
+    XXH64_hash_t tnt_XXH64 (const void* input, size_t length, unsigned long long seed);
+
+    typedef struct XXH32_state_s XXH32_state_t;
+    typedef struct XXH64_state_s XXH64_state_t;
+
+    XXH_errorcode tnt_XXH32_reset  (XXH32_state_t* statePtr, unsigned int seed);
+    XXH_errorcode tnt_XXH32_update (XXH32_state_t* statePtr, const void* input, size_t length);
+    XXH32_hash_t  tnt_XXH32_digest (const XXH32_state_t* statePtr);
+
+    XXH_errorcode tnt_XXH64_reset  (XXH64_state_t* statePtr, unsigned long long seed);
+    XXH_errorcode tnt_XXH64_update (XXH64_state_t* statePtr, const void* input, size_t length);
+    XXH64_hash_t  tnt_XXH64_digest (const XXH64_state_t* statePtr);
+
+    void tnt_XXH32_copyState(XXH32_state_t* restrict dst_state, const XXH32_state_t* restrict src_state);
+    void tnt_XXH64_copyState(XXH64_state_t* restrict dst_state, const XXH64_state_t* restrict src_state);
 ]]
+
+local builtin = ffi.C
 
 -- @sa base64.h
 local BASE64_NOPAD = 1
@@ -53,12 +101,12 @@ local PMurHash_methods = {
         if type(str) ~= 'string' then
             error("Usage: murhash:update(string)")
         end
-        ffi.C.PMurHash32_Process(self.seed, self.value, str, string.len(str))
+        builtin.PMurHash32_Process(self.seed, self.value, str, string.len(str))
         self.total_length = self.total_length + string.len(str)
     end,
 
     result = function(self)
-        return ffi.C.PMurHash32_Result(self.seed[0], self.value[0], self.total_length)
+        return builtin.PMurHash32_Result(self.seed[0], self.value[0], self.total_length)
     end,
 
     clear = function(self)
@@ -95,7 +143,7 @@ setmetatable(PMurHash, {
         if type(str) ~= 'string' then
             error("Usage: digest.murhash(string)")
         end
-        return ffi.C.PMurHash32(PMurHash.default_seed, str, string.len(str))
+        return builtin.PMurHash32(PMurHash.default_seed, str, string.len(str))
     end
 })
 
@@ -105,7 +153,7 @@ local CRC32_methods = {
         if type(str) ~= 'string' then
             error("Usage crc32:update(string)")
         end
-        self.value = ffi.C.crc32_calc(self.value, str, string.len(str))
+        self.value = builtin.crc32_calc(self.value, str, string.len(str))
     end,
 
     result = function(self)
@@ -138,7 +186,7 @@ setmetatable(CRC32, {
         if type(str) ~= 'string' then
             error("Usage digest.crc32(string)")
         end
-        return ffi.C.crc32_calc(CRC32.crc_begin, str, string.len(str))
+        return builtin.crc32_calc(CRC32.crc_begin, str, string.len(str))
     end
 })
 
@@ -179,10 +227,13 @@ local m = {
             end
         end
         local blen = #bin
-        local slen = ffi.C.base64_bufsize(blen, mask)
-        local str  = static_alloc('char', slen)
-        local len = ffi.C.base64_encode(bin, blen, str, slen, mask)
-        return ffi.string(str, len)
+        local slen = builtin.base64_bufsize(blen, mask)
+        local ibuf = cord_ibuf_take()
+        local str = ibuf:alloc(slen)
+        local len = builtin.base64_encode(bin, blen, str, slen, mask)
+        str = ffi.string(str, len)
+        cord_ibuf_put(ibuf)
+        return str
     end,
 
     base64_decode = function(str)
@@ -191,9 +242,12 @@ local m = {
         end
         local slen = #str
         local blen = math.ceil(slen * 3 / 4)
-        local bin  = static_alloc('char', blen)
-        local len = ffi.C.base64_decode(str, slen, bin, blen)
-        return ffi.string(bin, len)
+        local ibuf = cord_ibuf_take()
+        local bin = ibuf:alloc(blen)
+        local len = builtin.base64_decode(str, slen, bin, blen)
+        bin = ffi.string(bin, len)
+        cord_ibuf_put(ibuf)
+        return bin
     end,
 
     crc32 = CRC32,
@@ -202,14 +256,14 @@ local m = {
         if type(str) ~= 'string' then
             error("Usage: digest.crc32_update(string)")
         end
-        return ffi.C.crc32_calc(tonumber(crc), str, string.len(str))
+        return builtin.crc32_calc(tonumber(crc), str, string.len(str))
     end,
 
     sha1 = function(str)
         if type(str) ~= 'string' then
             error("Usage: digest.sha1(string)")
         end
-        local r = ffi.C.SHA1internal(str, #str, nil)
+        local r = builtin.SHA1internal(str, #str, nil)
         return ffi.string(r, 20)
     end,
 
@@ -217,21 +271,24 @@ local m = {
         if type(str) ~= 'string' then
             error("Usage: digest.sha1_hex(string)")
         end
-        local r = ffi.C.SHA1internal(str, #str, nil)
+        local r = builtin.SHA1internal(str, #str, nil)
         return string.hex(ffi.string(r, 20))
     end,
 
     guava = function(state, buckets)
-       return ffi.C.guava(state, buckets)
+        return builtin.guava(state, buckets)
     end,
 
     urandom = function(n)
         if n == nil then
             error('Usage: digest.urandom(len)')
         end
-        local buf = static_alloc('char', n)
-        ffi.C.random_bytes(buf, n)
-        return ffi.string(buf, n)
+        local ibuf = cord_ibuf_take()
+        local buf = ibuf:alloc(n)
+        builtin.random_bytes(buf, n)
+        buf = ffi.string(buf, n)
+        cord_ibuf_put(ibuf)
+        return buf
     end,
 
     murmur = PMurHash,
@@ -266,5 +323,74 @@ m['aes256cbc'] = {
         return crypto.cipher.aes256.cbc.decrypt(str, key, iv)
     end
 }
+
+for _, var in ipairs({'32', '64'}) do
+    local xxHash
+
+    local xxh_template = 'tnt_XXH%s_%s'
+    local update_fn_name = string.format(xxh_template, var, 'update')
+    local digest_fn_name = string.format(xxh_template, var, 'digest')
+    local reset_fn_name = string.format(xxh_template, var, 'reset')
+    local copy_fn_name = string.format(xxh_template, var, 'copyState')
+
+    local function update(self, str)
+        if type(str) ~= 'string' then
+            local message = string.format("Usage xxhash%s:update(string)", var)
+            error(message, 2)
+        end
+        builtin[update_fn_name](self.value, str, #str)
+    end
+
+    local function result(self)
+        return builtin[digest_fn_name](self.value)
+    end
+
+    local function clear(self, seed)
+        if seed == nil then
+            seed = self.default_seed
+        end
+        builtin[reset_fn_name](self.value, seed)
+    end
+
+    local function copy(self)
+        local copy = xxHash.new()
+        builtin[copy_fn_name](copy.value, self.value)
+        return copy
+    end
+
+    local state_type_name = string.format('XXH%s_state_t', var)
+    local XXH_state_t = ffi.typeof(state_type_name)
+
+    xxHash = {
+        new = function(seed)
+            local self = {
+                update = update,
+                result = result,
+                clear = clear,
+                copy = copy,
+                value = ffi.new(XXH_state_t),
+                default_seed = seed or 0,
+            }
+            self:clear(self.default_seed)
+            return self
+        end,
+    }
+
+    local call_fn_name = 'tnt_XXH' .. var
+    setmetatable(xxHash, {
+        __call = function(_, str, seed)
+            if type(str) ~= 'string' then
+                local message = string.format("Usage digest.xxhash%s(string[, unsigned number])", var)
+                error(message, 2)
+            end
+            if seed == nil then
+                seed = 0
+            end
+            return builtin[call_fn_name](str, #str, seed)
+        end,
+    })
+
+    m['xxhash' .. var] = xxHash
+end
 
 return m

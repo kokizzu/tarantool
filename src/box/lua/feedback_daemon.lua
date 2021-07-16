@@ -108,6 +108,7 @@ local function fill_in_base_info(feedback)
     feedback.tarantool_version = box.info.version
     feedback.server_id         = box.info.uuid
     feedback.cluster_id        = box.info.cluster.uuid
+    feedback.uptime            = box.info.uptime
 end
 
 local function fill_in_platform_info(feedback)
@@ -311,27 +312,36 @@ local function fill_in_stats(feedback)
     feedback.stats = stats
 end
 
-local function fill_in_feedback(feedback)
+local function fill_in_events(self, feedback)
+    feedback.events = self.cached_events
+end
+
+local function fill_in_feedback(self, feedback)
     fill_in_base_info(feedback)
     fill_in_platform_info(feedback)
     fill_in_repo_url(feedback)
     fill_in_features(feedback)
     fill_in_options(feedback)
     fill_in_stats(feedback)
+    fill_in_events(self, feedback)
 
     return feedback
 end
 
 local function feedback_loop(self)
     fiber.name(PREFIX, { truncate = true })
+    -- Speed up the first send.
+    local send_timeout = math.min(120, self.interval)
 
     while true do
-        local feedback = self:generate_feedback()
-        local msg = self.control:get(self.interval)
+        local msg = self.control:get(send_timeout)
+        send_timeout = self.interval
         -- if msg == "send" then we simply send feedback
         if msg == "stop" then
             break
-        elseif feedback ~= nil then
+        end
+        local feedback = self:generate_feedback()
+        if feedback ~= nil then
             pcall(http.post, self.host, json.encode(feedback), {timeout=1})
         end
     end
@@ -356,12 +366,28 @@ local function guard_loop(self)
     self.shutdown:put("stopped")
 end
 
+local function save_event(self, event)
+    if type(event) ~= 'string' then
+        error("Usage: box.internal.feedback_daemon.save_event(string)")
+    end
+    if type(self.cached_events) ~= 'table' then
+        return
+    end
+
+    self.cached_events[event] = (self.cached_events[event] or 0) + 1
+end
+
 -- these functions are used for test purposes only
 local function start(self)
     self:stop()
     if self.enabled then
-        self.control = fiber.channel()
+        -- There may be up to 5 fibers triggering a send during bootstrap or
+        -- shortly after it. And maybe more to come. Do not make anyone wait for
+        -- feedback daemon to process the incoming events, and set channel size
+        -- to 10 just in case.
+        self.control = fiber.channel(10)
         self.shutdown = fiber.channel()
+        self.cached_events = {}
         self.guard = fiber.create(guard_loop, self)
     end
     log.verbose("%s started", PREFIX)
@@ -400,7 +426,7 @@ setmetatable(daemon, {
         end,
         -- this function is used in saving feedback in file
         generate_feedback = function()
-            return fill_in_feedback({ feedback_version = 5 })
+            return fill_in_feedback(daemon, { feedback_version = 7 })
         end,
         start = function()
             start(daemon)
@@ -411,7 +437,10 @@ setmetatable(daemon, {
         reload = function()
             reload(daemon)
         end,
-        send_test = function()
+        save_event = function(event)
+            save_event(daemon, event)
+        end,
+        send = function()
             if daemon.control ~= nil then
                 daemon.control:put("send")
             end

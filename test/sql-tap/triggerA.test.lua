@@ -36,7 +36,6 @@ test:do_test(
             CREATE TABLE t1(x INTEGER PRIMARY KEY, y TEXT UNIQUE);
             CREATE TABLE t2(a INTEGER PRIMARY KEY, b INTEGER UNIQUE, c TEXT);
         ]]
-        local i = 1
         local words = {"one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"}
         for i, word in ipairs(words) do
         -- for _ in X(0, "X!foreach", [=[["word","one two three four five six seven eight nine ten"]]=]) do
@@ -46,7 +45,6 @@ test:do_test(
                 INSERT INTO t1 VALUES(%d,'%s');
                 INSERT INTO t2 VALUES(20-%d,%d,'%s');
             ]], i, word, i, j, word))
-            i = i + 1
         end
         return test:execsql [[
             SELECT count(*) FROM t1 UNION ALL SELECT count(*) FROM t2;

@@ -33,6 +33,7 @@
 #include "small/rlist.h"
 #include "index.h"
 #include "tuple.h"
+#include "space.h"
 
 #include "small/rlist.h"
 
@@ -77,31 +78,16 @@ struct tx_read_tracker {
 };
 
 /**
- * Pointer to tuple or story.
- */
-struct memtx_story_or_tuple {
-	/** Flag whether it's a story. */
-	bool is_story;
-	union {
-		/** Pointer to story, it must be reverse liked. */
-		struct memtx_story *story;
-		/** Smart pointer to tuple: the tuple is referenced if set. */
-		struct tuple *tuple;
-	};
-};
-
-/**
  * Link that connects a memtx_story with older and newer stories of the same
  * key in index.
  */
 struct memtx_story_link {
 	/** Story that was happened after that story was ended. */
 	struct memtx_story *newer_story;
-	/**
-	 * Older story or ancient tuple (so old that its story was lost).
-	 * In case of tuple is can also be NULL.
-	 */
-	struct memtx_story_or_tuple older;
+	/** Story that was happened before that story was started. */
+	struct memtx_story *older_story;
+	/** List of interval items @sa interval_hole_item. */
+	struct rlist nearby_gaps;
 };
 
 /**
@@ -275,7 +261,7 @@ memtx_tx_history_commit_stmt(struct txn_stmt *stmt);
 /** Helper of memtx_tx_tuple_clarify */
 struct tuple *
 memtx_tx_tuple_clarify_slow(struct txn *txn, struct space *space,
-			    struct tuple *tuple, uint32_t index,
+			    struct tuple *tuples, struct index *index,
 			    uint32_t mk_index, bool is_prepared_ok);
 
 /**
@@ -285,19 +271,79 @@ memtx_tx_tuple_clarify_slow(struct txn *txn, struct space *space,
 int
 memtx_tx_track_read(struct txn *txn, struct space *space, struct tuple *tuple);
 
+
+/** Helper of memtx_tx_track_point */
+int
+memtx_tx_track_point_slow(struct txn *txn, struct index *index,
+			  const char *key);
+
+/**
+ * Record in TX manager that a transaction @a txn have read a nothing
+ * from @a space and @ a index with @ key.
+ * The key is expected to be full, that is has part count equal to part
+ * count in unique cmp_key of the index.
+ * @return 0 on success, -1 on memory error.
+ */
+static inline int
+memtx_tx_track_point(struct txn *txn, struct space *space,
+		     struct index *index, const char *key)
+{
+	if (!memtx_tx_manager_use_mvcc_engine)
+		return 0;
+	if (txn == NULL)
+		return 0;
+	/* Skip ephemeral spaces. */
+	if (space == NULL || space->def->id == 0)
+		return 0;
+	return memtx_tx_track_point_slow(txn, index, key);
+}
+
+/**
+ * Helper of memtx_tx_track_gap.
+ */
+int
+memtx_tx_track_gap_slow(struct txn *txn, struct space *space, struct index *index,
+			struct tuple *successor, enum iterator_type type,
+			const char *key, uint32_t part_count);
+
+/**
+ * Record in TX manager that a transaction @a txn have read nothing
+ * from @a space and @ a index with @ key, somewhere from interval between
+ * some unknown predecessor and @a successor.
+ * This function must be used for ordered indexes, such as TREE, for queries
+ * when interation type is not EQ or when the key is not full (otherwise
+ * it's faster to use memtx_tx_track_point).
+ * @return 0 on success, -1 on memory error.
+ */
+static inline int
+memtx_tx_track_gap(struct txn *txn, struct space *space, struct index *index,
+		   struct tuple *successor, enum iterator_type type,
+		   const char *key, uint32_t part_count)
+{
+	if (!memtx_tx_manager_use_mvcc_engine)
+		return 0;
+	if (txn == NULL)
+		return 0;
+	/* Skip ephemeral spaces. */
+	if (space == NULL || space->def->id == 0)
+		return 0;
+	return memtx_tx_track_gap_slow(txn, space, index, successor,
+				       type, key, part_count);
+}
+
 /**
  * Clean a tuple if it's dirty - finds a visible tuple in history.
  * @param txn - current transactions.
  * @param space - space in which the tuple was found.
  * @param tuple - tuple to clean.
- * @param index - index number.
+ * @param index - index in which the tuple was found.
  * @param mk_index - multikey index (iа the index is multikey).
  * @param is_prepared_ok - allow to return prepared tuples.
  * @return clean tuple (can be NULL).
  */
 static inline struct tuple *
 memtx_tx_tuple_clarify(struct txn *txn, struct space *space,
-		       struct tuple *tuple, uint32_t index,
+		       struct tuple *tuple, struct index *index,
 		       uint32_t mk_index, bool is_prepared_ok)
 {
 	if (!memtx_tx_manager_use_mvcc_engine)
@@ -309,6 +355,39 @@ memtx_tx_tuple_clarify(struct txn *txn, struct space *space,
 	return memtx_tx_tuple_clarify_slow(txn, space, tuple, index, mk_index,
 					   is_prepared_ok);
 }
+
+uint32_t
+memtx_tx_index_invisible_count_slow(struct txn *txn,
+				    struct space *space, struct index *index);
+
+/**
+ * When MVCC engine is enabled, an index can contain temporary non-committed
+ * tuples that are not visible outside their transaction.
+ * That's why internal index size can be greater than visible by
+ * standalone observer.
+ * The function calculates tje number of tuples that are physically present
+ * in index, but have no visible value.
+ */
+static inline uint32_t
+memtx_tx_index_invisible_count(struct txn *txn,
+			       struct space *space, struct index *index)
+{
+	if (!memtx_tx_manager_use_mvcc_engine)
+		return 0;
+	return memtx_tx_index_invisible_count_slow(txn, space, index);
+}
+
+/**
+ * Clean memtx_tx part of @a txm.
+ */
+void
+memtx_tx_clean_txn(struct txn *txn);
+
+/**
+ * Notify manager tha an index is deleted and free data, save in index.
+ */
+void
+memtx_tx_on_index_delete(struct index *index);
 
 /**
  * Notify manager the a space is deleted.

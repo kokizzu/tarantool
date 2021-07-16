@@ -18,7 +18,6 @@ test:plan(7)
 --
 -- ["set","testdir",[["file","dirname",["argv0"]]]]
 -- ["source",[["testdir"],"\/tester.tcl"]]
-local testprefix = "index4"
 test:do_execsql_test(
     1.1,
     [[
@@ -51,15 +50,13 @@ test:do_execsql_test(
     ]])
 
 -- do_execsql_test 1.3 {
---   PRAGMA integrity_check 
+--   PRAGMA integrity_check
 -- } {ok}
 -- The same test again - this time with limited memory.
 --
 
 -- MUST_WORK_TEST limit memory
 --soft_limit = sql_soft_heap_limit(50000)
---db("close")
---sql("db", "test.db")
 --test:do_execsql_test(
 --    1.4,
 --    [[
@@ -94,11 +91,11 @@ test:do_execsql_test(
           INSERT INTO t1 SELECT randomblob(4202) FROM t1;     --   128
           INSERT INTO t1 SELECT randomblob(5202) FROM t1;     --   256
         COMMIT;
-        CREATE INDEX i1 ON t1(x); 
+        CREATE INDEX i1 ON t1(x);
         --PRAGMA integrity_check
     ]], {
         -- <1.6>
-        
+
         -- </1.6>
     })
 
@@ -110,11 +107,11 @@ test:do_execsql_test(
           CREATE TABLE t1(x TEXT primary key);
           INSERT INTO t1 VALUES('a');
         --COMMIT;
-        CREATE INDEX i1 ON t1(x); 
+        CREATE INDEX i1 ON t1(x);
         --PRAGMA integrity_check
     ]], {
         -- <1.7>
-        
+
         -- </1.7>
     })
 
@@ -128,11 +125,11 @@ if (1 > 0)
               DROP TABLE t1;
               CREATE TABLE t1(x INT primary key);
             --COMMIT;
-            CREATE INDEX i1 ON t1(x); 
+            CREATE INDEX i1 ON t1(x);
             --PRAGMA integrity_check
         ]], {
             -- <1.8>
-            
+
             -- </1.8>
         })
 
@@ -156,7 +153,7 @@ test:do_catchsql_test(
         CREATE UNIQUE INDEX i3 ON t2(x);
     ]], {
         -- <2.2>
-        1, "Duplicate key exists in unique index 'I3' in space 'T2'"
+        1, "Duplicate key exists in unique index \"I3\" in space \"T2\" with old tuple - [2, 35] and new tuple - [4, 35]"
         -- </2.2>
     })
 

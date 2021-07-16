@@ -18,7 +18,6 @@ test:plan(18)
 -- $Id: select7.test,v 1.11 2007/09/12 17:01:45 danielk1977 Exp $
 -- ["set","testdir",[["file","dirname",["argv0"]]]]
 -- ["source",[["testdir"],"\/tester.tcl"]]
-local testprefix = "select7"
 -- A 3-way INTERSECT.  Ticket #875
 test:do_execsql_test(
     "select7-1.1",
@@ -193,7 +192,7 @@ test:do_execsql_test(
         INSERT INTO t3 VALUES(56.0);
     ]], {
         -- <select7-7.1>
-        
+
         -- </select7-7.1>
     })
 
@@ -216,7 +215,7 @@ test:do_execsql_test(
         INSERT INTO t4 VALUES( 3.0 );
     ]], {
         -- <select7-7.3>
-        
+
         -- </select7-7.3>
     })
 
@@ -233,7 +232,7 @@ test:do_execsql_test(
 test:do_execsql_test(
     "select7-7.5",
     [[
-        SELECT a=0, typeof(a) FROM t4 
+        SELECT a=0, typeof(a) FROM t4
     ]], {
         -- <select7-7.5>
         false, "number", false, "number"
@@ -243,7 +242,7 @@ test:do_execsql_test(
 test:do_execsql_test(
     "select7-7.6",
     [[
-        SELECT a=0, typeof(a) FROM t4 GROUP BY a 
+        SELECT a=0, typeof(a) FROM t4 GROUP BY a
     ]], {
         -- <select7-7.6>
         false, "number", false, "number"

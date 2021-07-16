@@ -40,9 +40,11 @@ endmacro(set_source_files_compile_flags)
 # A helper function to compile *.lua source into *.lua.c sources
 function(lua_source varname filename)
     if (IS_ABSOLUTE "${filename}")
+        string (REPLACE "${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}"
+            genname "${filename}")
         set (srcfile "${filename}")
-        set (tmpfile "${filename}.new.c")
-        set (dstfile "${filename}.c")
+        set (tmpfile "${genname}.new.c")
+        set (dstfile "${genname}.c")
     else(IS_ABSOLUTE "${filename}")
         set (srcfile "${CMAKE_CURRENT_SOURCE_DIR}/${filename}")
         set (tmpfile "${CMAKE_CURRENT_BINARY_DIR}/${filename}.new.c")
@@ -86,3 +88,31 @@ function(bin_source varname srcfile dstfile)
 
 endfunction()
 
+#
+# Whether a file is descendant to a directory.
+#
+# If the file is the directory itself, the answer is FALSE.
+#
+function(file_is_in_directory varname file dir)
+    file(RELATIVE_PATH file_relative "${dir}" "${file}")
+
+    # Tricky point: one may find <STREQUAL ".."> and
+    # <MATCHES "^\\.\\./"> if-branches quite similar and coalesce
+    # them as <MATCHES "^\\.\\.">. However it'll match paths like
+    # "..." or "..foo/bar", whose are definitely descendant to
+    # the directory.
+    if (file_relative STREQUAL "")
+        # <file> and <dir> is the same directory.
+        set(${varname} FALSE PARENT_SCOPE)
+    elseif (file_relative STREQUAL "..")
+        # <dir> inside a <file> (so it is a directory too), not
+        # vice versa.
+        set(${varname} FALSE PARENT_SCOPE)
+    elseif (file_relative MATCHES "^\\.\\./")
+        # <file> somewhere outside of the <dir>.
+        set(${varname} FALSE PARENT_SCOPE)
+    else()
+        # <file> is descendant to <dir>.
+        set(${varname} TRUE PARENT_SCOPE)
+    endif()
+endfunction()

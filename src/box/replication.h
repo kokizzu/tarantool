@@ -331,6 +331,11 @@ struct replica {
 	 * separate from applier.
 	 */
 	enum applier_state applier_sync_state;
+	/**
+	 * Applier's last written to WAL transaction timestamp.
+	 * Needed for relay lagging statistics.
+	 */
+	double applier_txn_last_tm;
 	/* The latch is used to order replication requests. */
 	struct latch order_latch;
 };
@@ -356,10 +361,11 @@ struct replica *
 replica_by_id(uint32_t replica_id);
 
 /**
- * Return the replica set leader.
+ * Find a node in the replicaset on which the instance can try to register to
+ * join the replicaset.
  */
 struct replica *
-replicaset_leader(void);
+replicaset_find_join_master(void);
 
 struct replica *
 replicaset_first(void);

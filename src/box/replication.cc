@@ -184,6 +184,7 @@ replica_new(void)
 	trigger_create(&replica->on_applier_state,
 		       replica_on_applier_state_f, NULL, NULL);
 	replica->applier_sync_state = APPLIER_DISCONNECTED;
+	replica->applier_txn_last_tm = 0;
 	latch_create(&replica->order_latch);
 	return replica;
 }
@@ -250,6 +251,7 @@ replica_set_id(struct replica *replica, uint32_t replica_id)
 						   tt_uuid_str(&replica->uuid));
 	}
 	replicaset.replica_by_id[replica_id] = replica;
+	gc_delay_ref();
 	++replicaset.registered_count;
 	say_info("assigned id %d to replica %s",
 		 replica->id, tt_uuid_str(&replica->uuid));
@@ -273,6 +275,7 @@ replica_clear_id(struct replica *replica)
 	replicaset.replica_by_id[replica->id] = NULL;
 	assert(replicaset.registered_count > 0);
 	--replicaset.registered_count;
+	gc_delay_unref();
 	if (replica->id == instance_id) {
 		/* See replica_check_id(). */
 		assert(replicaset.is_joining);
@@ -949,75 +952,63 @@ replicaset_next(struct replica *replica)
 	return replica_hash_next(&replicaset.hash, replica);
 }
 
-/**
- * Compare vclock, read only mode and orphan status
- * of all connected replicas and elect a leader.
- * Initiallly, skip read-only replicas, since they
- * can not properly act as bootstrap masters (register
- * new nodes in _cluster table). If there are no read-write
- * replicas, choose a read-only replica with biggest vclock
- * as a leader, in hope it will become read-write soon.
- */
-static struct replica *
-replicaset_round(bool skip_ro)
+struct replica *
+replicaset_find_join_master(void)
 {
 	struct replica *leader = NULL;
+	int leader_score = -1;
 	replicaset_foreach(replica) {
 		struct applier *applier = replica->applier;
 		if (applier == NULL)
 			continue;
-		/**
-		 * While bootstrapping a new cluster, read-only
-		 * replicas shouldn't be considered as a leader.
-		 * The only exception if there is no read-write
-		 * replicas since there is still a possibility
-		 * that all replicas exist in cluster table.
-		 */
-		if (skip_ro && applier->ballot.is_ro)
-			continue;
-		if (leader == NULL) {
-			leader = replica;
-			continue;
-		}
+		const struct ballot *ballot = &applier->ballot;
+		int score = 0;
 		/*
-		 * Try to find a replica which has already left
-		 * orphan mode.
+		 * First of all try to ignore non-booted instances. Including
+		 * self if not booted yet. For self it is even dangerous as the
+		 * instance might decide to boot its own cluster if, for
+		 * example, the other nodes are available, but read-only. It
+		 * would be a mistake.
+		 *
+		 * For a new cluster it is ok to use a non-booted instance as it
+		 * means the algorithm tries to find an initial "boot-master".
+		 *
+		 * Prefer instances not configured as read-only via box.cfg, and
+		 * not being in read-only state due to any other reason. The
+		 * config is stronger because if it is configured as read-only,
+		 * it is in read-only state for sure, until the config is
+		 * changed.
 		 */
-		if (applier->ballot.is_loading && ! leader->applier->ballot.is_loading)
+		if (ballot->is_booted)
+			score += 10;
+		if (!ballot->is_ro_cfg)
+			score += 5;
+		if (!ballot->is_ro)
+			score += 1;
+		if (leader_score < score)
+			goto elect;
+		if (score < leader_score)
 			continue;
+		const struct ballot *leader_ballot;
+		leader_ballot = &leader->applier->ballot;
 		/*
 		 * Choose the replica with the most advanced
 		 * vclock. If there are two or more replicas
 		 * with the same vclock, prefer the one with
 		 * the lowest uuid.
 		 */
-		int cmp = vclock_compare_ignore0(&applier->ballot.vclock,
-						 &leader->applier->ballot.vclock);
+		int cmp;
+		cmp = vclock_compare_ignore0(&ballot->vclock,
+					     &leader_ballot->vclock);
 		if (cmp < 0)
 			continue;
 		if (cmp == 0 && tt_uuid_compare(&replica->uuid,
 						&leader->uuid) > 0)
 			continue;
+elect:
 		leader = replica;
+		leader_score = score;
 	}
-	return leader;
-}
-
-struct replica *
-replicaset_leader(void)
-{
-	bool skip_ro = true;
-	/**
-	 * Two loops, first prefers read-write replicas among others.
-	 * Second for backward compatibility, if there is no such
-	 * replicas at all.
-	 */
-	struct replica *leader = replicaset_round(skip_ro);
-	if (leader == NULL) {
-		skip_ro = false;
-		leader = replicaset_round(skip_ro);
-	}
-
 	return leader;
 }
 

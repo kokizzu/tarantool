@@ -75,9 +75,8 @@ lbox_push_txn_stmt(struct lua_State *L, void *event)
 	}
 	/* @todo: maybe the space object has to be here */
 	lua_pushstring(L, stmt->space->def->name);
-	assert(stmt->row != NULL);
 	/* operation type: INSERT/UPDATE/UPSERT/REPLACE/DELETE */
-	lua_pushstring(L, iproto_type_name(stmt->row->type));
+	lua_pushstring(L, iproto_type_name(stmt->type));
 	return 4;
 }
 
@@ -262,16 +261,15 @@ lbox_fillspace(struct lua_State *L, struct space *space, int i)
 	lua_pushboolean(L, space_index(space, 0) != 0);
 	lua_settable(L, i);
 
+	/* space:on_replace */
+	lua_pushstring(L, "on_replace");
+	lua_pushcfunction(L, lbox_space_on_replace);
+	lua_settable(L, i);
 
-        /* space:on_replace */
-        lua_pushstring(L, "on_replace");
-        lua_pushcfunction(L, lbox_space_on_replace);
-        lua_settable(L, i);
-
-        /* space:before_replace */
-        lua_pushstring(L, "before_replace");
-        lua_pushcfunction(L, lbox_space_before_replace);
-        lua_settable(L, i);
+	/* space:before_replace */
+	lua_pushstring(L, "before_replace");
+	lua_pushcfunction(L, lbox_space_before_replace);
+	lua_settable(L, i);
 
 	lua_getfield(L, i, "index");
 	if (lua_isnil(L, -1)) {
@@ -568,8 +566,7 @@ lbox_space_frommap(struct lua_State *L)
 	space = space_by_id(id);
 	if (space == NULL) {
 		lua_pushnil(L);
-		lua_pushstring(L, tt_sprintf("Space with id '%d' "\
-					     "doesn't exist", id));
+		lua_pushfstring(L, "Space with id '%d' doesn't exist", id);
 		return 2;
 	}
 	assert(space->format != NULL);
@@ -586,8 +583,7 @@ lbox_space_frommap(struct lua_State *L)
 		if (tuple_fieldno_by_name(dict, key, key_len, key_hash,
 					  &fieldno)) {
 			lua_pushnil(L);
-			lua_pushstring(L, tt_sprintf("Unknown field '%s'",
-						     key));
+			lua_pushfstring(L, "Unknown field '%s'", key);
 			return 2;
 		}
 		lua_rawseti(L, -3, fieldno+1);

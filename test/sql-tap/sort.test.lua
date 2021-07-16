@@ -19,7 +19,6 @@ test:plan(60)
 --
 -- ["set","testdir",[["file","dirname",["argv0"]]]]
 -- ["source",[["testdir"],"\/tester.tcl"]]
-local testprefix = "sort"
 -- Create a bunch of data to sort against
 --
 test:do_test(
@@ -656,7 +655,7 @@ test:do_execsql_test(
         INSERT INTO t7 VALUES(4);
     ]], {
         -- <sort-10.1>
-        
+
         -- </sort-10.1>
     })
 
@@ -740,7 +739,7 @@ test:do_test(
         test:execsql("COMMIT;")
     end, {
         -- <sort-13.1>
-        
+
         -- </sort-13.1>
     })
 
@@ -761,7 +760,10 @@ test:do_execsql_test(
 --
 -- MUST_WORK_TEST? special sql functions (sql_soft_heap_limit, sql_test_control...)
 if (0 > 0) then
-local function cksum(x)
+-- Legacy from the original code. Must be replaced with analogue
+-- functions from box.
+local X = nil
+local function cksum(x) -- luacheck: no unused
     local i1 = 1
     local i2 = 2
     X(503, "X!cmd", [=[["binary","scan",["x"],"c*","L"]]=])
@@ -789,24 +791,36 @@ box.internal.sql_create_function("cksum", cksum)
             UPDATE t11 SET b = cksum(a);
         ]])
 
+    -- Legacy from the original code. Must be replaced with analogue
+    -- functions from box.
+    local tn = nil
+    local sql_test_control = nil
+    local mmap_limit = nil
     for _ in X(0, "X!foreach", [=[["tn mmap_limit","\n     1 0\n     2 1000000\n   "]]=]) do
         test:do_test(
             "sort-14."..tn,
             function()
                 sql_test_control("sql_TESTCTRL_SORTER_MMAP", "db", mmap_limit)
-                local prev = ""
+                local prev = "" -- luacheck: no unused
                 X(536, "X!cmd", [=[["db","eval"," SELECT * FROM t11 ORDER BY b ","\n         if {$b != [cksum $a]} {error \"checksum failed\"}\n         if {[string compare $b $prev] < 0} {error \"sort failed\"}\n         set prev $b\n       "]]=])
                 return X(541, "X!cmd", [=[["set","",""]]=])
             end, {
-                
+
             })
 
     end
     ---------------------------------------------------------------------------
     --
+    -- Legacy from the original code. Must be replaced with analogue
+    -- functions from box.
+    local coremutex = nil
+    local sql_config = nil
+    local sql_initialize = nil
+    local sql_soft_heap_limit = nil
+    local tmpstore = nil
+    local softheaplimit = nil
+    local nWorker = nil
     for _ in X(0, "X!foreach", [=[["tn mmap_limit nWorker tmpstore coremutex fakeheap softheaplimit","\n             1          0       3     file      true    false             0\n             2          0       3     file      true     true             0\n             3          0       0     file      true    false             0\n             4    1000000       3     file      true    false             0\n             5          0       0   memory     false     true             0\n             6          0       0     file     false     true       1000000     \n             7          0       0     file     false     true         10000\n   "]]=]) do
-        db("close")
-        sql_shutdown()
         if coremutex then
             sql_config("multithread")
         else
@@ -815,7 +829,6 @@ box.internal.sql_create_function("cksum", cksum)
         sql_initialize()
         X(558, "X!cmd", [=[["sorter_test_fakeheap",["fakeheap"]]]=])
         sql_soft_heap_limit(softheaplimit)
-        reset_db()
         sql_test_control("sql_TESTCTRL_SORTER_MMAP", "db", mmap_limit)
         test:execsql(string.format("PRAGMA temp_store = %s; PRAGMA threads = '%s'", tmpstore, nWorker))
         local ten, one
@@ -870,15 +883,12 @@ box.internal.sql_create_function("cksum", cksum)
 
         X(605, "X!cmd", [=[["sorter_test_fakeheap","0"]]=])
     end
-    db("close")
-    sql_shutdown()
     X(617, "X!cmd", [=[["set","t(0)","singlethread"]]=])
     X(618, "X!cmd", [=[["set","t(1)","multithread"]]=])
     X(619, "X!cmd", [=[["set","t(2)","serialized"]]=])
     sql_config(X(620, "X!expr", [=[["t($sql_options(threadsafe))"]]=]))
     sql_initialize()
     sql_soft_heap_limit(0)
-    reset_db()
     test:do_catchsql_test(
         16.1,
         [[
@@ -895,7 +905,6 @@ box.internal.sql_create_function("cksum", cksum)
             -- </16.1>
         })
 
-    reset_db()
     test:do_catchsql_test(
         16.2,
         [[
@@ -912,14 +921,13 @@ box.internal.sql_create_function("cksum", cksum)
             -- </16.2>
         })
 
-    reset_db()
     test:do_execsql_test(
         17.1,
         [[
             SELECT * FROM sql_master ORDER BY sql;
         ]], {
             -- <17.1>
-            
+
             -- </17.1>
         })
 

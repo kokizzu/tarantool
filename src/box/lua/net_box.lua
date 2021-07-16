@@ -15,7 +15,6 @@ local fiber_clock       = fiber.clock
 local fiber_self        = fiber.self
 local decode            = msgpack.decode_unchecked
 local decode_map_header = msgpack.decode_map_header
-local buffer_reg        = buffer.reg1
 
 local table_new           = require('table.new')
 local check_iterator_type = box.internal.check_iterator_type
@@ -147,17 +146,16 @@ local method_decoder = {
 }
 
 local function decode_error(raw_data)
-    local ptr = buffer_reg.acucp
-    ptr[0] = raw_data
+    local ptr = ffi.new('const char *[1]', raw_data)
     local err = ffi.C.error_unpack_unsafe(ptr)
     if err ~= nil then
         err._refs = err._refs + 1
-        err = ffi.gc(err, ffi.C.error_unref)
         -- From FFI it is returned as 'struct error *', which is
         -- not considered equal to 'const struct error &', and is
         -- is not accepted by functions like box.error(). Need to
         -- cast explicitly.
         err = ffi.cast('const struct error &', err)
+        err = ffi.gc(err, ffi.C.error_unref)
     else
         -- Error unpacker installs fail reason into diag.
         box.error()
@@ -1384,6 +1382,7 @@ function remote_methods:_install_schema(schema_version, spaces, indices,
                 local pknullable = index[PARTS][k].is_nullable or false
                 local pkexcludenull = index[PARTS][k].exclude_null or false
                 local pkcollationid = index[PARTS][k].collation
+                local pkpath = index[PARTS][k].path
                 local pktype = index[PARTS][k][2] or index[PARTS][k].type
                 local pkfield = index[PARTS][k][1] or index[PARTS][k].field
                 -- resolve a collation name if a peer has
@@ -1397,7 +1396,8 @@ function remote_methods:_install_schema(schema_version, spaces, indices,
                     type = pktype,
                     fieldno = pkfield + 1,
                     is_nullable = pknullable,
-                    exclude_null = pkexcludenull
+                    exclude_null = pkexcludenull,
+                    path = pkpath,
                 }
                 if collations == nil then
                     pk.collation_id = pkcollationid

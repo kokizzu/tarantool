@@ -52,8 +52,6 @@ test:do_execsql_test(
 -- test:do_test(
 --     "autoinc-1.4",
 --     function()
---         db("close")
---         sql("db", "test.db")
 --         return test:execsql([[
 --             SELECT * FROM _sequence;
 --         ]])
@@ -615,10 +613,10 @@ test:do_catchsql_test(
     [[
             DROP TABLE IF EXISTS t2;
             CREATE TABLE t2(x INT PRIMARY KEY AUTOINCREMENT);
-            INSERT INTO t2 VALUES('asd'); 
+            INSERT INTO t2 VALUES('asd');
     ]], {
         -- <autoinc-10.2>
-        1, "Type mismatch: can not convert asd to integer"
+        1, "Type mismatch: can not convert string('asd') to integer"
         -- </autoinc-10.2>
     })
 
@@ -811,7 +809,7 @@ test:do_catchsql_test(
         INSERT INTO t1 SELECT s2, s2 FROM t1;
     ]], {
         -- <autoinc-gh-3670>
-        1, "Type mismatch: can not convert a to integer"
+        1, "Type mismatch: can not convert string('a') to integer"
         -- </autoinc-gh-3670>
     })
 

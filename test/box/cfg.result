@@ -41,6 +41,8 @@ cfg_filter(box.cfg)
  |     - false
  |   - - hot_standby
  |     - false
+ |   - - iproto_threads
+ |     - 1
  |   - - listen
  |     - <hidden>
  |   - - log
@@ -85,6 +87,8 @@ cfg_filter(box.cfg)
  |     - 1
  |   - - slab_alloc_factor
  |     - 1.05
+ |   - - slab_alloc_granularity
+ |     - 8
  |   - - sql_cache_size
  |     - 5242880
  |   - - strip_core
@@ -113,6 +117,8 @@ cfg_filter(box.cfg)
  |     - 60
  |   - - vinyl_write_threads
  |     - 4
+ |   - - wal_cleanup_delay
+ |     - 14400
  |   - - wal_dir
  |     - <hidden>
  |   - - wal_dir_rescan_delay
@@ -121,6 +127,8 @@ cfg_filter(box.cfg)
  |     - 268435456
  |   - - wal_mode
  |     - write
+ |   - - wal_queue_max_size
+ |     - 16777216
  |   - - worker_pool_threads
  |     - 4
  | ...
@@ -156,6 +164,8 @@ cfg_filter(box.cfg)
  |     - false
  |   - - hot_standby
  |     - false
+ |   - - iproto_threads
+ |     - 1
  |   - - listen
  |     - <hidden>
  |   - - log
@@ -200,6 +210,8 @@ cfg_filter(box.cfg)
  |     - 1
  |   - - slab_alloc_factor
  |     - 1.05
+ |   - - slab_alloc_granularity
+ |     - 8
  |   - - sql_cache_size
  |     - 5242880
  |   - - strip_core
@@ -228,6 +240,8 @@ cfg_filter(box.cfg)
  |     - 60
  |   - - vinyl_write_threads
  |     - 4
+ |   - - wal_cleanup_delay
+ |     - 14400
  |   - - wal_dir
  |     - <hidden>
  |   - - wal_dir_rescan_delay
@@ -236,6 +250,8 @@ cfg_filter(box.cfg)
  |     - 268435456
  |   - - wal_mode
  |     - write
+ |   - - wal_queue_max_size
+ |     - 16777216
  |   - - worker_pool_threads
  |     - 4
  | ...

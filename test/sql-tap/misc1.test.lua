@@ -226,7 +226,7 @@ test:do_test(
         return test.lindex(r, 1)
     end, {
         -- <misc1-3.1>
-        
+
         -- </misc1-3.1>
     })
 
@@ -392,7 +392,7 @@ test:do_catchsql_test(
         INSERT INTO t5 VALUES(1,2,4);
     ]], {
         -- <misc1-7.4>
-        1, "Duplicate key exists in unique index 'pk_unnamed_T5_1' in space 'T5'"
+        1, "Duplicate key exists in unique index \"pk_unnamed_T5_1\" in space \"T5\" with old tuple - [1, 2, 3] and new tuple - [1, 2, 4]"
         -- </misc1-7.4>
     })
 
@@ -580,6 +580,11 @@ if (0 > 0) then
     test:do_test(
         "misc1-11.1",
         function()
+            -- Legacy from the original code. Must be replaced with analogue
+            -- functions from box.
+            local sql = nil
+            local X = nil
+            local msg = nil
             test:execsql("START TRANSACTION")
             test:execsql("UPDATE t1 SET a=0 WHERE 0")
             sql("db2", "test.db")
@@ -595,9 +600,12 @@ if (0 > 0) then
     test:do_test(
         "misc1-11.2",
         function()
+            -- Legacy from the original code. Must be replaced with analogue
+            -- functions from box.
+            local X = nil
+            local msg = nil
             test:execsql("COMMIT")
             local rc = X(377, "X!cmd", [=[["catch","db2 eval {SELECT count(*) FROM t1}","msg"]]=])
-            db2("close")
             return table.insert(rc,msg) or rc
         end, {
             -- <misc1-11.2>
@@ -725,8 +733,12 @@ test:do_execsql_test(
 
 -- MUST_WORK_TEST collate
 if 0>0 then
+    -- Legacy from the original code. Must be replaced with analogue
+    -- functions from box.
+    local db = nil
+    local X = nil
     db("collate", "numeric", "numeric_collate")
-    local function numeric_collate(lhs, rhs)
+    local function numeric_collate(lhs, rhs) -- luacheck: no unused
         if (lhs == rhs)
         then
             return 0
@@ -736,7 +748,7 @@ if 0>0 then
 
     -- Mimic the sql 2 collation type TEXT.
     db("collate", "text", "text_collate")
-    local function numeric_collate(lhs, rhs)
+    local function numeric_collate(lhs, rhs) -- luacheck: no unused
         return X(34, "X!cmd", [=[["string","compare",["lhs"],["rhs"]]]=])
     end
 
@@ -777,7 +789,7 @@ test:do_execsql_test(
 end
 
 -- There was a problem with realloc() in the OP_MemStore operation of
--- the VDBE.  A buffer was being reallocated but some pointers into 
+-- the VDBE.  A buffer was being reallocated but some pointers into
 -- the old copy of the buffer were not being moved over to the new copy.
 -- The following code tests for the problem.
 --
@@ -957,7 +969,7 @@ if (0 > 0) then
             CREATE TABLE RealTable(TestID INTEGER PRIMARY KEY, TestString TEXT);
             CREATE TABLE TempTable(TestID INTEGER PRIMARY KEY, TestString TEXT);
             CREATE TRIGGER trigTest_1 AFTER UPDATE ON TempTable BEGIN
-              INSERT INTO RealTable(TestString) 
+              INSERT INTO RealTable(TestString)
                  SELECT new.TestString FROM TempTable LIMIT 1;
             END;
             INSERT INTO TempTable(TestString) VALUES ('1');
@@ -1062,8 +1074,6 @@ test:do_catchsql_test(
 
 -- # 2015-04-19: NULL pointer dereference on a corrupt schema
 -- #
--- db close
--- sql db :memory:
 -- do_execsql_test misc1-23.1 {
 --   CREATE TABLE t1(x INT );
 --   UPDATE sql_master SET sql='CREATE table t(d CHECK(T(#0)';
@@ -1074,9 +1084,7 @@ test:do_catchsql_test(
 -- } {}
 -- # 2015-04-19:  Faulty assert() statement
 -- #
--- db close
 -- database_may_be_corrupt
--- sql db :memory:
 -- do_catchsql_test misc1-23.2 {
 --   CREATE TABLE t1(x  INT UNIQUE);
 --   UPDATE sql_master SET sql='CREATE TABLE IF not EXISTS t(c)';
@@ -1085,8 +1093,6 @@ test:do_catchsql_test(
 --   ROLLBACK;
 --   DROP TABLE F;
 -- } {1 {no such table: F}}
--- db close
--- sql db :memory:
 -- do_catchsql_test misc1-23.3 {
 --   CREATE TABLE t1(x  INT UNIQUE);
 --   UPDATE sql_master SET sql='CREATE table y(a TEXT, a TEXT)';
@@ -1095,7 +1101,7 @@ test:do_catchsql_test(
 --   ROLLBACK;
 --   DROP TABLE IF EXISTS t;
 -- } {0 {}}
--- # At one point, running this would read one byte passed the end of a 
+-- # At one point, running this would read one byte passed the end of a
 -- # buffer, upsetting valgrind.
 -- #
 -- do_test misc1-24.0 {

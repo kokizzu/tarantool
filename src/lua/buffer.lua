@@ -7,7 +7,15 @@ ffi.cdef[[
 struct slab_cache;
 struct slab_cache *
 tarantool_lua_slab_cache();
-extern struct ibuf *tarantool_lua_ibuf;
+
+struct ibuf *
+cord_ibuf_take(void);
+
+void
+cord_ibuf_put(struct ibuf *ibuf);
+
+void
+cord_ibuf_drop(struct ibuf *ibuf);
 
 struct ibuf
 {
@@ -33,38 +41,6 @@ ibuf_reinit(struct ibuf *ibuf);
 
 void *
 ibuf_reserve_slow(struct ibuf *ibuf, size_t size);
-
-void *
-lua_static_aligned_alloc(size_t size, size_t alignment);
-
-/**
- * Register is a buffer to use with FFI functions, which usually
- * operate with pointers to scalar values like int, char, size_t,
- * void *. To avoid doing 'ffi.new(<type>[1])' on each such FFI
- * function invocation, a module can use one of attributes of the
- * register union.
- *
- * Naming policy of the attributes is easy to remember:
- * 'a' for array type + type name first letters + 'p' for pointer.
- *
- * For example:
- * - int[1] - <a>rray of <i>nt - ai;
- * - const unsigned char *[1] -
- *       <a>rray of <c>onst <u>nsigned <c>har <p> pointer - acucp.
- */
-union c_register {
-    size_t as[1];
-    void *ap[1];
-    int ai[1];
-    char ac[1];
-    const unsigned char *acucp[1];
-    unsigned long aul[1];
-    uint16_t u16;
-    uint32_t u32;
-    uint64_t u64;
-    int64_t i64;
-    int64_t ai64[1];
-};
 ]]
 
 local builtin = ffi.C
@@ -207,50 +183,96 @@ local function ibuf_new(arg)
 end
 
 --
--- NOTE: ffi.new() with inlined size <= 128 works even faster
---       than this allocator. If your size is a constant <= 128 -
---       use ffi.new(). This function is faster than malloc,
---       ffi.new(> 128), and ffi.new() with any size not known in
---       advance like this:
+-- Stash keeps an FFI object for re-usage and helps to ensure the proper
+-- ownership. Is supposed to be used in yield-free code when almost always it is
+-- possible to put the taken object back.
+-- Then cost of the stash is almost the same as ffi.new() for small objects like
+-- 'int[1]' even when jitted. Examples:
 --
---           local size = <any expression>
---           ffi.new('char[?]', size)
+-- * ffi.new('int[1]') is about ~0.4ns, while the stash take() + put() is about
+--   ~0.8ns;
 --
--- Allocate a chunk of static BSS memory, or use ordinal ffi.new,
--- when too big size.
--- @param type C type - a struct, a basic type, etc. Should be a
---        string: 'int', 'char *', 'struct tuple', etc.
--- @param size Optional argument, number of elements of @a type to
---        allocate. 1 by default.
--- @return Cdata pointer to @a type.
+-- * Much better on objects > 128 bytes in size. ffi.new('struct uri[1]') is
+--   ~300ns, while the stash is still ~0.8ns;
 --
-local function static_alloc(type, size)
-    size = size or 1
-    local bsize = size * ffi.sizeof(type)
-    local ptr = builtin.lua_static_aligned_alloc(bsize, ffi.alignof(type))
-    if ptr ~= nil then
-        return ffi.cast(type..' *', ptr)
+-- * For structs not allocated as an array is also much better than ffi.new().
+--   For instance, ffi.new('struct tt_uuid') is ~300ns, the stash is ~0.8ns.
+--   Even though 'struct tt_uuid' is 16 bytes;
+--
+local function ffi_stash_new(c_type)
+    local item = nil
+
+    local function take()
+        local res
+        -- This line is guaranteed to be GC-safe. GC is not invoked. Because
+        -- there are no allocation. So it can be considered 'atomic'.
+        res, item = item, nil
+        -- The next lines don't need to be atomic and can survive GC. The only
+        -- important part was to take the global item and set it to nil.
+        if res then
+            return res
+        end
+        return ffi.new(c_type)
     end
-    return ffi.new(type..'[?]', size)
+
+    local function put(i)
+        -- It is ok to rewrite the existing global item if it was set. Does
+        -- not matter. They are all the same.
+        item = i
+    end
+
+    -- Due to some random reason if the stash returns a table with methods it
+    -- works faster than returning them as multiple values. Regardless of how
+    -- the methods are used later. Even if the caller will cache take and put
+    -- methods anyway.
+    return {
+        take = take,
+        put = put,
+    }
 end
 
 --
--- Sometimes it is wanted to use several temporary registers at
--- once. For example, when a C function takes 2 C pointers. Then
--- one register is not enough - its attributes share memory. Note,
--- registers are not allocated with separate ffi.new calls
--- deliberately. With a single allocation they fit into 1 cache
--- line, and reduce the heap fragmentation.
+-- Cord buffer is useful for the places, where
 --
-local reg_array = ffi.new('union c_register[?]', 2)
+-- * Want to reuse the already allocated memory which might be stored in the
+--   cord buf. Although sometimes the buffer is recycled, so should not rely on
+--   being able to reuse it always. When reused, the win is the biggest -
+--   becomes about x20 times faster than a new buffer creation (~5ns vs ~100ns);
+--
+-- * Want to avoid allocation of a new ibuf because it produces a new GC object
+--   which is additional load for Lua GC. Although according to benches it is
+--   not super expensive;
+--
+-- * Almost always can put the buffer back manually. Not rely on it being
+--   recycled automatically. It is recycled, but still should not rely on that;
+--
+-- It is important to wrap the C functions, not expose them directly. Because
+-- JIT works a bit better when C functions are called as 'ffi.C.func()' than
+-- 'func()' with func being cached. The only pros is to cache 'ffi.C' itself.
+-- It is quite strange though how having them wrapped into a Lua function is
+-- faster than cached directly as C functions.
+--
+local function cord_ibuf_take()
+    return builtin.cord_ibuf_take()
+end
+
+local function cord_ibuf_put(buf)
+    return builtin.cord_ibuf_put(buf)
+end
+
+local function cord_ibuf_drop(buf)
+    return builtin.cord_ibuf_drop(buf)
+end
+
+local internal = {
+    cord_ibuf_take = cord_ibuf_take,
+    cord_ibuf_put = cord_ibuf_put,
+    cord_ibuf_drop = cord_ibuf_drop,
+}
 
 return {
+    internal = internal,
     ibuf = ibuf_new;
-    IBUF_SHARED = ffi.C.tarantool_lua_ibuf;
     READAHEAD = READAHEAD;
-    static_alloc = static_alloc,
-    -- Keep reference.
-    reg_array = reg_array,
-    reg1 = reg_array[0],
-    reg2 = reg_array[1]
+    ffi_stash_new = ffi_stash_new,
 }

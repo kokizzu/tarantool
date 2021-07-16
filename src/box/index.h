@@ -413,9 +413,19 @@ struct index_vtab {
 			 const char *key, uint32_t part_count);
 	int (*get)(struct index *index, const char *key,
 		   uint32_t part_count, struct tuple **result);
+	/**
+	 * Main entrance point for changing data in index. Once built and
+	 * before deletion this is the only way to insert, replace and delete
+	 * data from the index.
+	 * @param mode - @sa dup_replace_mode description
+	 * @param result - here the replaced or deleted tuple is placed.
+	 * @param successor - if the index supports ordering, then in case of
+	 *  insert (!) here the successor tuple is returned. In other words,
+	 *  here will be stored the tuple, before which new tuple is inserted.
+	 */
 	int (*replace)(struct index *index, struct tuple *old_tuple,
 		       struct tuple *new_tuple, enum dup_replace_mode mode,
-		       struct tuple **result);
+		       struct tuple **result, struct tuple **successor);
 	/** Create an index iterator. */
 	struct iterator *(*create_iterator)(struct index *index,
 			enum iterator_type type,
@@ -458,8 +468,18 @@ struct index {
 	struct index_def *def;
 	/** Reference counter. */
 	int refs;
-	/* Space cache version at the time of construction. */
+	/** Space cache version at the time of construction. */
 	uint32_t space_cache_version;
+	/** Globally unique ID. */
+	uint32_t unique_id;
+	/** Compact ID - index in space->index array. */
+	uint32_t dense_id;
+	/**
+	 * List of gap read in the index with NULL successor. Those gap
+	 * reads happen when reading from empty index, or when reading
+	 * from rightmost part of ordered index (TREE).
+	 */
+	struct rlist nearby_gaps;
 };
 
 /**
@@ -472,12 +492,12 @@ replace_check_dup(struct tuple *old_tuple, struct tuple *dup_tuple,
 {
 	if (dup_tuple == NULL) {
 		if (mode == DUP_REPLACE) {
+			assert(old_tuple != NULL);
 			/*
 			 * dup_replace_mode is DUP_REPLACE, and
 			 * a tuple with the same key is not found.
 			 */
-			return old_tuple ?
-			       ER_CANT_UPDATE_PRIMARY_KEY : ER_TUPLE_NOT_FOUND;
+			return ER_CANT_UPDATE_PRIMARY_KEY;
 		}
 	} else { /* dup_tuple != NULL */
 		if (dup_tuple != old_tuple &&
@@ -644,7 +664,7 @@ index_filter_tuple(struct index *index, struct tuple *tuple) {
 static inline int
 index_replace(struct index *index, struct tuple *old_tuple,
 	      struct tuple *new_tuple, enum dup_replace_mode mode,
-	      struct tuple **result)
+	      struct tuple **result, struct tuple **successor)
 {
 	old_tuple = index_filter_tuple(index, old_tuple);
 	new_tuple = index_filter_tuple(index, new_tuple);
@@ -652,7 +672,8 @@ index_replace(struct index *index, struct tuple *old_tuple,
 		*result = NULL;
 		return 0;
 	}
-	return index->vtab->replace(index, old_tuple, new_tuple, mode, result);
+	return index->vtab->replace(index, old_tuple, new_tuple, mode,
+				    result, successor);
 }
 
 static inline struct iterator *
@@ -730,7 +751,8 @@ ssize_t generic_index_count(struct index *, enum iterator_type,
 			    const char *, uint32_t);
 int generic_index_get(struct index *, const char *, uint32_t, struct tuple **);
 int generic_index_replace(struct index *, struct tuple *, struct tuple *,
-			  enum dup_replace_mode, struct tuple **);
+			  enum dup_replace_mode,
+			  struct tuple **, struct tuple **);
 struct snapshot_iterator *generic_index_create_snapshot_iterator(struct index *);
 void generic_index_stat(struct index *, struct info_handler *);
 void generic_index_compact(struct index *);
@@ -747,7 +769,7 @@ disabled_index_build_next(struct index *index, struct tuple *tuple);
 int
 disabled_index_replace(struct index *index, struct tuple *old_tuple,
 		       struct tuple *new_tuple, enum dup_replace_mode mode,
-		       struct tuple **result);
+		       struct tuple **result, struct tuple **successor);
 
 #if defined(__cplusplus)
 } /* extern "C" */

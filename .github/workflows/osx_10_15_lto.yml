@@ -1,6 +1,11 @@
 name: osx_10_15_lto
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  repository_dispatch:
+    types: [backend_automation]
+  workflow_dispatch:
 
 env:
   CI_MAKE: make -f .travis.mk
@@ -26,7 +31,8 @@ jobs:
       - uses: ./.github/actions/environment
       - name: test
         env:
-          CMAKE_EXTRA_PARAMS: -DENABLE_LTO=ON
+          CMAKE_BUILD_TYPE: RelWithDebInfo
+          CMAKE_EXTRA_PARAMS: -DENABLE_WERROR=ON -DENABLE_LTO=ON
         run: ${CI_MAKE} test_osx_github_actions
       - name: call action to send Telegram message on failure
         env:
@@ -40,4 +46,4 @@ jobs:
         with:
           name: osx_10_15_lto
           retention-days: 21
-          path: /tmp/tnt/artifacts
+          path: ${{ env.VARDIR }}/artifacts

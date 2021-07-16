@@ -1,6 +1,5 @@
 #!/usr/bin/env tarantool
 local test = require("sqltester")
-local json = require("json")
 test:plan(34)
 
 --!./tcltestrunner.lua
@@ -49,7 +48,7 @@ test:do_test(
         ]])
     end, {
         -- <misc3-1.1>
-        
+
         -- </misc3-1.1>
     })
 
@@ -83,7 +82,7 @@ test:do_test(
         ]])
     end, {
         -- <misc3-1.2>
-        
+
         -- </misc3-1.2>
     })
 
@@ -191,7 +190,7 @@ test:do_execsql_test(
         CREATE TABLE t2(a INT PRIMARY KEY);
     ]], {
         -- <misc3-3.2>
-        
+
         -- </misc3-3.2>
     })
 
@@ -202,7 +201,7 @@ test:do_execsql_test(
         INSERT INTO t2 VALUES(2147483648);
     ]], {
         -- <misc3-3.3>
-        
+
         -- </misc3-3.3>
     })
 
@@ -213,7 +212,7 @@ test:do_execsql_test(
         INSERT INTO t2 VALUES(-2147483649);
     ]], {
         -- <misc3-3.4>
-        
+
         -- </misc3-3.4>
     })
 
@@ -224,7 +223,7 @@ test:do_execsql_test(
         INSERT INTO t2 VALUES(+2147483649);
     ]], {
         -- <misc3-3.5>
-        
+
         -- </misc3-3.5>
     })
 

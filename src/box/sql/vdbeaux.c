@@ -41,6 +41,7 @@
 #include "box/txn.h"
 #include "msgpuck/msgpuck.h"
 #include "sqlInt.h"
+#include "mem.h"
 #include "vdbeInt.h"
 #include "tarantoolInt.h"
 #include "box/execute.h"
@@ -1107,21 +1108,8 @@ displayP4(Op * pOp, char *zTemp, int nTemp)
 			break;
 		}
 	case P4_MEM:{
-			Mem *pMem = pOp->p4.pMem;
-			if (pMem->flags & MEM_Str) {
-				zP4 = pMem->z;
-			} else if (pMem->flags & MEM_Int) {
-				sqlXPrintf(&x, "%lld", pMem->u.i);
-			} else if (pMem->flags & MEM_UInt) {
-				sqlXPrintf(&x, "%llu", pMem->u.u);
-			} else if (pMem->flags & MEM_Real) {
-				sqlXPrintf(&x, "%.16g", pMem->u.r);
-			} else if (pMem->flags & MEM_Null) {
-				zP4 = "NULL";
-			} else {
-				assert(pMem->flags & MEM_Blob);
-				zP4 = "(binary string)";
-			}
+			const char *value = mem_str(pOp->p4.pMem);
+			sqlStrAccumAppend(&x, value, strlen(value));
 			break;
 		}
 	case P4_INTARRAY:{
@@ -1195,65 +1183,6 @@ sqlVdbePrintOp(FILE * pOut, int pc, Op * pOp)
 #endif
 
 /*
- * Initialize an array of N Mem element.
- */
-static void
-initMemArray(Mem * p, int N, sql * db, u32 flags)
-{
-	while ((N--) > 0) {
-		p->db = db;
-		p->flags = flags;
-		p->szMalloc = 0;
-		p->field_type = field_type_MAX;
-#ifdef SQL_DEBUG
-		p->pScopyFrom = 0;
-#endif
-		p++;
-	}
-}
-
-/*
- * Release an array of N Mem elements
- */
-static void
-releaseMemArray(Mem * p, int N)
-{
-	if (p && N) {
-		Mem *pEnd = &p[N];
-		sql *db = p->db;
-		do {
-			assert((&p[1]) == pEnd || p[0].db == p[1].db);
-			assert(sqlVdbeCheckMemInvariants(p));
-
-			/* This block is really an inlined version of sqlVdbeMemRelease()
-			 * that takes advantage of the fact that the memory cell value is
-			 * being set to NULL after releasing any dynamic resources.
-			 *
-			 * The justification for duplicating code is that according to
-			 * callgrind, this causes a certain test case to hit the CPU 4.7
-			 * percent less (x86 linux, gcc version 4.1.2, -O6) than if
-			 * sqlMemRelease() were called from here. With -O2, this jumps
-			 * to 6.6 percent. The test case is inserting 1000 rows into a table
-			 * with no indexes using a single prepared INSERT statement, bind()
-			 * and reset(). Inserts are grouped into a transaction.
-			 */
-			testcase(p->flags & MEM_Agg);
-			testcase(p->flags & MEM_Dyn);
-			testcase(p->flags & MEM_Frame);
-			if (p->
-			    flags & (MEM_Agg | MEM_Dyn | MEM_Frame)) {
-				sqlVdbeMemRelease(p);
-			} else if (p->szMalloc) {
-				sqlDbFree(db, p->zMalloc);
-				p->szMalloc = 0;
-			}
-
-			p->flags = MEM_Undefined;
-		} while ((++p) < pEnd);
-	}
-}
-
-/*
  * Delete a VdbeFrame object and its contents. VdbeFrame objects are
  * allocated by the OP_Program opcode in sqlVdbeExec().
  */
@@ -1322,7 +1251,7 @@ sqlVdbeList(Vdbe * p)
 		 */
 		assert(p->nMem > 9);
 		pSub = &p->aMem[9];
-		if (pSub->flags & MEM_Blob) {
+		if (mem_is_bin(pSub)) {
 			/* On the first call to sql_step(), pSub will hold a NULL.  It is
 			 * initialized to a BLOB by the P4_SUBPROGRAM processing logic below
 			 */
@@ -1360,14 +1289,12 @@ sqlVdbeList(Vdbe * p)
 		}
 		if (p->explain == 1) {
 			assert(i >= 0);
-			mem_set_u64(pMem, i);
+			mem_set_uint(pMem, i);
 
 			pMem++;
 
-			pMem->flags = MEM_Static | MEM_Str | MEM_Term;
-			pMem->z = (char *)sqlOpcodeName(pOp->opcode);	/* Opcode */
-			assert(pMem->z != 0);
-			pMem->n = sqlStrlen30(pMem->z);
+			char *value = (char *)sqlOpcodeName(pOp->opcode);
+			mem_set_str0_static(pMem, value);
 			pMem++;
 
 			/* When an OP_Program opcode is encounter (the only opcode that has
@@ -1376,67 +1303,67 @@ sqlVdbeList(Vdbe * p)
 			 * has not already been seen.
 			 */
 			if (pOp->p4type == P4_SUBPROGRAM) {
-				int nByte = (nSub + 1) * sizeof(SubProgram *);
 				int j;
 				for (j = 0; j < nSub; j++) {
 					if (apSub[j] == pOp->p4.pProgram)
 						break;
 				}
-				if (j == nSub &&
-				    sqlVdbeMemGrow(pSub, nByte,
-						   nSub != 0) == 0) {
-					apSub = (SubProgram **) pSub->z;
-					apSub[nSub++] = pOp->p4.pProgram;
-					pSub->flags |= MEM_Blob;
-					pSub->n = nSub * sizeof(SubProgram *);
+				if (nSub == 0) {
+					uint32_t size = sizeof(SubProgram *);
+					char *bin = (char *)&pOp->p4.pProgram;
+					if (mem_copy_bin(pSub, bin, size) != 0)
+						return -1;
+				} else if (j == nSub) {
+					struct Mem tmp;
+					mem_create(&tmp);
+					uint32_t size = sizeof(SubProgram *);
+					char *bin = (char *)&pOp->p4.pProgram;
+					mem_set_bin_ephemeral(&tmp, bin, size);
+					int rc = mem_concat(pSub, &tmp, pSub);
+					mem_destroy(&tmp);
+					if (rc != 0)
+						return -1;
 				}
 			}
 		}
 
-		mem_set_i64(pMem, pOp->p1);
+		mem_set_int(pMem, pOp->p1, pOp->p1 < 0);
 		pMem++;
 
-		mem_set_i64(pMem, pOp->p2);
+		mem_set_int(pMem, pOp->p2, pOp->p2 < 0);
 		pMem++;
 
-		mem_set_i64(pMem, pOp->p3);
+		mem_set_int(pMem, pOp->p3, pOp->p3 < 0);
 		pMem++;
 
-		if (sqlVdbeMemClearAndResize(pMem, 256)) {
-			assert(p->db->mallocFailed);
+		char *buf = sqlDbMallocRaw(sql_get(), 256);
+		if (buf == NULL)
 			return -1;
-		}
-		pMem->flags = MEM_Str | MEM_Term;
-		zP4 = displayP4(pOp, pMem->z, pMem->szMalloc);
-
-		if (zP4 != pMem->z) {
-			pMem->n = 0;
-			sqlVdbeMemSetStr(pMem, zP4, -1, 1, 0);
+		zP4 = displayP4(pOp, buf, sqlDbMallocSize(sql_get(), buf));
+		if (zP4 != buf) {
+			sqlDbFree(sql_get(), buf);
+			mem_set_str0_ephemeral(pMem, zP4);
 		} else {
-			assert(pMem->z != 0);
-			pMem->n = sqlStrlen30(pMem->z);
+			mem_set_str0_allocated(pMem, zP4);
 		}
 		pMem++;
 
 		if (p->explain == 1) {
-			if (sqlVdbeMemClearAndResize(pMem, 4)) {
-				assert(p->db->mallocFailed);
+			buf = sqlDbMallocRaw(sql_get(), 4);
+			if (buf == NULL)
 				return -1;
-			}
-			pMem->flags = MEM_Str | MEM_Term;
-			pMem->n = 2;
-			sql_snprintf(3, pMem->z, "%.2x", pOp->p5);	/* P5 */
+			sql_snprintf(3, buf, "%.2x", pOp->p5);
+			mem_set_str0_allocated(pMem, buf);
 			pMem++;
 
 #ifdef SQL_ENABLE_EXPLAIN_COMMENTS
-			if (sqlVdbeMemClearAndResize(pMem, 500)) {
-				assert(p->db->mallocFailed);
+			buf = sqlDbMallocRaw(sql_get(), 500);
+			if (buf == NULL)
 				return -1;
-			}
-			pMem->flags = MEM_Str | MEM_Term;
-			pMem->n = displayComment(pOp, zP4, pMem->z, 500);
+			displayComment(pOp, zP4, buf, 500);
+			mem_set_str0_allocated(pMem, buf);
 #else
-			pMem->flags = MEM_Null;	/* Comment */
+			mem_set_null(pMem);
 #endif
 		}
 
@@ -1658,9 +1585,13 @@ sqlVdbeMakeReady(Vdbe * p,	/* The VDBE */
 	} else {
 		p->nCursor = nCursor;
 		p->nVar = (ynVar) nVar;
-		initMemArray(p->aVar, nVar, db, MEM_Null);
+		for (int i = 0; i < nVar; ++i)
+			mem_create(&p->aVar[i]);
 		p->nMem = nMem;
-		initMemArray(p->aMem, nMem, db, MEM_Undefined);
+		for (int i = 0; i < nMem; ++i) {
+			mem_create(&p->aMem[i]);
+			mem_set_invalid(&p->aMem[i]);
+		}
 		memset(p->apCsr, 0, nCursor * sizeof(VdbeCursor *));
 	}
 	sqlVdbeRewind(p);
@@ -1787,7 +1718,7 @@ Cleanup(Vdbe * p)
 			assert(p->apCsr[i] == 0);
 	if (p->aMem) {
 		for (i = 0; i < p->nMem; i++)
-			assert(p->aMem[i].flags == MEM_Undefined);
+			assert(mem_is_invalid(&p->aMem[i]));
 	}
 #endif
 
@@ -2329,207 +2260,11 @@ sqlVdbeAllocUnpackedRecord(struct sql *db, struct key_def *key_def)
 	if (!p)
 		return 0;
 	p->aMem = (Mem *) & ((char *)p)[ROUND8(sizeof(UnpackedRecord))];
+	for (uint32_t i = 0; i < key_def->part_count + 1; ++i)
+		mem_create(&p->aMem[i]);
 	p->key_def = key_def;
 	p->nField = key_def->part_count + 1;
 	return p;
-}
-
-/*
- * Both *pMem1 and *pMem2 contain string values. Compare the two values
- * using the collation sequence pColl. As usual, return a negative , zero
- * or positive value if *pMem1 is less than, equal to or greater than
- * *pMem2, respectively. Similar in spirit to "rc = (*pMem1) - (*pMem2);".
- *
- * Strungs assume to be UTF-8 encoded
- */
-static int
-vdbeCompareMemString(const Mem * pMem1, const Mem * pMem2,
-		     const struct coll * pColl)
-{
-	return pColl->cmp(pMem1->z, (size_t)pMem1->n,
-			      pMem2->z, (size_t)pMem2->n, pColl);
-}
-
-/*
- * The input pBlob is guaranteed to be a Blob that is not marked
- * with MEM_Zero.  Return true if it could be a zero-blob.
- */
-static int
-isAllZero(const char *z, int n)
-{
-	int i;
-	for (i = 0; i < n; i++) {
-		if (z[i])
-			return 0;
-	}
-	return 1;
-}
-
-/*
- * Compare two blobs.  Return negative, zero, or positive if the first
- * is less than, equal to, or greater than the second, respectively.
- * If one blob is a prefix of the other, then the shorter is the lessor.
- */
-static SQL_NOINLINE int
-sqlBlobCompare(const Mem * pB1, const Mem * pB2)
-{
-	int c;
-	int n1 = pB1->n;
-	int n2 = pB2->n;
-
-	/* It is possible to have a Blob value that has some non-zero content
-	 * followed by zero content.  But that only comes up for Blobs formed
-	 * by the OP_MakeRecord opcode, and such Blobs never get passed into
-	 * sqlMemCompare().
-	 */
-	assert((pB1->flags & MEM_Zero) == 0 || n1 == 0);
-	assert((pB2->flags & MEM_Zero) == 0 || n2 == 0);
-
-	if ((pB1->flags | pB2->flags) & MEM_Zero) {
-		if (pB1->flags & pB2->flags & MEM_Zero) {
-			return pB1->u.nZero - pB2->u.nZero;
-		} else if (pB1->flags & MEM_Zero) {
-			if (!isAllZero(pB2->z, pB2->n))
-				return -1;
-			return pB1->u.nZero - n2;
-		} else {
-			if (!isAllZero(pB1->z, pB1->n))
-				return +1;
-			return n1 - pB2->u.nZero;
-		}
-	}
-	c = memcmp(pB1->z, pB2->z, n1 > n2 ? n2 : n1);
-	if (c)
-		return c;
-	return n1 - n2;
-}
-
-/*
- * Compare the values contained by the two memory cells, returning
- * negative, zero or positive if pMem1 is less than, equal to, or greater
- * than pMem2. Sorting order is NULL's first, followed by numbers (integers
- * and reals) sorted numerically, followed by text ordered by the collating
- * sequence pColl and finally blob's ordered by memcmp().
- *
- * Two NULL values are considered equal by this function.
- */
-int
-sqlMemCompare(const Mem * pMem1, const Mem * pMem2, const struct coll * pColl)
-{
-	int f1, f2;
-	int combined_flags;
-
-	f1 = pMem1->flags;
-	f2 = pMem2->flags;
-	combined_flags = f1 | f2;
-
-	/* If one value is NULL, it is less than the other. If both values
-	 * are NULL, return 0.
-	 */
-	if (combined_flags & MEM_Null) {
-		return (f2 & MEM_Null) - (f1 & MEM_Null);
-	}
-
-	if ((combined_flags & MEM_Bool) != 0) {
-		if ((f1 & f2 & MEM_Bool) != 0) {
-			if (pMem1->u.b == pMem2->u.b)
-				return 0;
-			if (pMem1->u.b)
-				return 1;
-			return -1;
-		}
-		if ((f2 & MEM_Bool) != 0)
-			return +1;
-		return -1;
-	}
-
-	/* At least one of the two values is a number
-	 */
-	if ((combined_flags & (MEM_Int | MEM_UInt | MEM_Real)) != 0) {
-		if ((f1 & f2 & MEM_Int) != 0) {
-			if (pMem1->u.i < pMem2->u.i)
-				return -1;
-			if (pMem1->u.i > pMem2->u.i)
-				return +1;
-			return 0;
-		}
-		if ((f1 & f2 & MEM_UInt) != 0) {
-			if (pMem1->u.u < pMem2->u.u)
-				return -1;
-			if (pMem1->u.u > pMem2->u.u)
-				return +1;
-			return 0;
-		}
-		if ((f1 & f2 & MEM_Real) != 0) {
-			if (pMem1->u.r < pMem2->u.r)
-				return -1;
-			if (pMem1->u.r > pMem2->u.r)
-				return +1;
-			return 0;
-		}
-		if ((f1 & MEM_Int) != 0) {
-			if ((f2 & MEM_Real) != 0) {
-				return double_compare_nint64(pMem2->u.r,
-							     pMem1->u.i, -1);
-			} else {
-				return -1;
-			}
-		}
-		if ((f1 & MEM_UInt) != 0) {
-			if ((f2 & MEM_Real) != 0) {
-				return double_compare_uint64(pMem2->u.r,
-							     pMem1->u.u, -1);
-			} else if ((f2 & MEM_Int) != 0) {
-				return +1;
-			} else {
-				return -1;
-			}
-		}
-		if ((f1 & MEM_Real) != 0) {
-			if ((f2 & MEM_Int) != 0) {
-				return double_compare_nint64(pMem1->u.r,
-							     pMem2->u.i, 1);
-			} else if ((f2 & MEM_UInt) != 0) {
-				return double_compare_uint64(pMem1->u.r,
-							     pMem2->u.u, 1);
-			} else {
-				return -1;
-			}
-		}
-		return +1;
-	}
-
-	/* If one value is a string and the other is a blob, the string is less.
-	 * If both are strings, compare using the collating functions.
-	 */
-	if (combined_flags & MEM_Str) {
-		if ((f1 & MEM_Str) == 0) {
-			return 1;
-		}
-		if ((f2 & MEM_Str) == 0) {
-			return -1;
-		}
-		/* The collation sequence must be defined at this point, even if
-		 * the user deletes the collation sequence after the vdbe program is
-		 * compiled (this was not always the case).
-		 */
-		if (pColl) {
-			return vdbeCompareMemString(pMem1, pMem2, pColl);
-		} else {
-			size_t n = pMem1->n < pMem2->n ? pMem1->n : pMem2->n;
-			int res;
-			res = memcmp(pMem1->z, pMem2->z, n);
-			if (res == 0)
-				res = (int)pMem1->n - (int)pMem2->n;
-			return res;
-		}
-		/* If a NULL pointer was passed as the collate function, fall through
-		 * to the blob case and use memcmp().
-		 */
-	}
-
-	/* Both values must be blobs.  Compare using memcmp().  */
-	return sqlBlobCompare(pMem1, pMem2);
 }
 
 /*
@@ -2593,261 +2328,15 @@ sqlVdbeGetBoundValue(Vdbe * v, int iVar, u8 aff)
 	assert(iVar > 0);
 	if (v) {
 		Mem *pMem = &v->aVar[iVar - 1];
-		if (0 == (pMem->flags & MEM_Null)) {
+		if (!mem_is_null(pMem)) {
 			sql_value *pRet = sqlValueNew(v->db);
 			if (pRet) {
-				sqlVdbeMemCopy((Mem *) pRet, pMem);
-				sql_value_apply_type(pRet, aff);
+				mem_copy(pRet, pMem);
+				mem_cast_implicit_old(pRet, aff);
 			}
 			return pRet;
 		}
 	}
-	return 0;
-}
-
-int
-sqlVdbeCompareMsgpack(const char **key1,
-			  struct UnpackedRecord *unpacked, int key2_idx)
-{
-	const char *aKey1 = *key1;
-	Mem *pKey2 = unpacked->aMem + key2_idx;
-	Mem mem1;
-	int rc = 0;
-	switch (mp_typeof(*aKey1)) {
-	default:{
-			/* FIXME */
-			rc = -1;
-			break;
-		}
-	case MP_NIL:{
-			rc = -((pKey2->flags & MEM_Null) == 0);
-			mp_decode_nil(&aKey1);
-			break;
-		}
-	case MP_BOOL:{
-			mem1.u.b = mp_decode_bool(&aKey1);
-			if ((pKey2->flags & MEM_Bool) != 0) {
-				if (mem1.u.b != pKey2->u.b)
-					rc = mem1.u.b ? 1 : -1;
-			} else {
-				rc = (pKey2->flags & MEM_Null) != 0 ? 1 : -1;
-			}
-			break;
-		}
-	case MP_UINT:{
-			mem1.u.u = mp_decode_uint(&aKey1);
-			if ((pKey2->flags & MEM_Int) != 0) {
-				rc = +1;
-			} else if ((pKey2->flags & MEM_UInt) != 0) {
-				if (mem1.u.u < pKey2->u.u)
-					rc = -1;
-				else if (mem1.u.u > pKey2->u.u)
-					rc = +1;
-			} else if ((pKey2->flags & MEM_Real) != 0) {
-				rc = double_compare_uint64(pKey2->u.r,
-							   mem1.u.u, -1);
-			} else if ((pKey2->flags & MEM_Null) != 0) {
-				rc = 1;
-			} else if ((pKey2->flags & MEM_Bool) != 0) {
-				rc = 1;
-			} else {
-				rc = -1;
-			}
-			break;
-		}
-	case MP_INT:{
-			mem1.u.i = mp_decode_int(&aKey1);
-			if ((pKey2->flags & MEM_UInt) != 0) {
-				rc = -1;
-			} else if ((pKey2->flags & MEM_Int) != 0) {
-				if (mem1.u.i < pKey2->u.i) {
-					rc = -1;
-				} else if (mem1.u.i > pKey2->u.i) {
-					rc = +1;
-				}
-			} else if (pKey2->flags & MEM_Real) {
-				rc = double_compare_nint64(pKey2->u.r, mem1.u.i,
-							   -1);
-			} else if ((pKey2->flags & MEM_Null) != 0) {
-				rc = 1;
-			} else if ((pKey2->flags & MEM_Bool) != 0) {
-				rc = 1;
-			} else {
-				rc = -1;
-			}
-			break;
-		}
-	case MP_FLOAT:{
-			mem1.u.r = mp_decode_float(&aKey1);
-			goto do_float;
-		}
-	case MP_DOUBLE:{
-			mem1.u.r = mp_decode_double(&aKey1);
- do_float:
-			if ((pKey2->flags & MEM_Int) != 0) {
-				rc = double_compare_nint64(mem1.u.r, pKey2->u.i,
-							   1);
-			} else if (pKey2->flags & MEM_UInt) {
-				rc = double_compare_uint64(mem1.u.r,
-							   pKey2->u.u, 1);
-			} else if (pKey2->flags & MEM_Real) {
-				if (mem1.u.r < pKey2->u.r) {
-					rc = -1;
-				} else if (mem1.u.r > pKey2->u.r) {
-					rc = +1;
-				}
-			} else if ((pKey2->flags & MEM_Null) != 0) {
-				rc = 1;
-			} else if ((pKey2->flags & MEM_Bool) != 0) {
-				rc = 1;
-			} else {
-				rc = -1;
-			}
-			break;
-		}
-	case MP_STR:{
-			if (pKey2->flags & MEM_Str) {
-				struct key_def *key_def = unpacked->key_def;
-				mem1.n = mp_decode_strl(&aKey1);
-				mem1.z = (char *)aKey1;
-				aKey1 += mem1.n;
-				struct coll *coll =
-					key_def->parts[key2_idx].coll;
-				if (coll != NULL) {
-					mem1.flags = MEM_Str;
-					rc = vdbeCompareMemString(&mem1, pKey2,
-								  coll);
-				} else {
-					goto do_bin_cmp;
-				}
-			} else {
-				rc = (pKey2->flags & MEM_Blob) ? -1 : +1;
-			}
-			break;
-		}
-	case MP_BIN:{
-			mem1.n = mp_decode_binl(&aKey1);
-			mem1.z = (char *)aKey1;
-			aKey1 += mem1.n;
- do_blob:
-			if (pKey2->flags & MEM_Blob) {
-				if (pKey2->flags & MEM_Zero) {
-					if (!isAllZero
-					    ((const char *)mem1.z, mem1.n)) {
-						rc = 1;
-					} else {
-						rc = mem1.n - pKey2->u.nZero;
-					}
-				} else {
-					int nCmp;
- do_bin_cmp:
-					nCmp = MIN(mem1.n, pKey2->n);
-					rc = memcmp(mem1.z, pKey2->z, nCmp);
-					if (rc == 0)
-						rc = mem1.n - pKey2->n;
-				}
-			} else {
-				rc = 1;
-			}
-			break;
-		}
-	case MP_ARRAY:
-	case MP_MAP:
-	case MP_EXT:{
-			mem1.z = (char *)aKey1;
-			mp_next(&aKey1);
-			mem1.n = aKey1 - (char *)mem1.z;
-			goto do_blob;
-		}
-	}
-	*key1 = aKey1;
-	return rc;
-}
-
-int
-sqlVdbeRecordCompareMsgpack(const void *key1,
-				struct UnpackedRecord *key2)
-{
-	int rc = 0;
-	u32 i, n = mp_decode_array((const char**)&key1);
-
-	n = MIN(n, key2->nField);
-
-	for (i = 0; i != n; i++) {
-		rc = sqlVdbeCompareMsgpack((const char**)&key1, key2, i);
-		if (rc != 0) {
-			if (key2->key_def->parts[i].sort_order !=
-			    SORT_ORDER_ASC) {
-				rc = -rc;
-			}
-			return rc;
-		}
-	}
-
-	key2->eqSeen = 1;
-	return key2->default_rc;
-}
-
-int
-vdbe_decode_msgpack_into_mem(const char *buf, struct Mem *mem, uint32_t *len)
-{
-	const char *start_buf = buf;
-	switch (mp_typeof(*buf)) {
-	case MP_ARRAY:
-	case MP_MAP:
-	case MP_EXT:
-	default: {
-		mem->flags = 0;
-		break;
-	}
-	case MP_NIL: {
-		mp_decode_nil(&buf);
-		mem->flags = MEM_Null;
-		break;
-	}
-	case MP_BOOL: {
-		mem->u.b = mp_decode_bool(&buf);
-		mem->flags = MEM_Bool;
-		break;
-	}
-	case MP_UINT: {
-		uint64_t v = mp_decode_uint(&buf);
-		mem->u.u = v;
-		mem->flags = MEM_UInt;
-		break;
-	}
-	case MP_INT: {
-		mem->u.i = mp_decode_int(&buf);
-		mem->flags = MEM_Int;
-		break;
-	}
-	case MP_STR: {
-		/* XXX u32->int */
-		mem->n = (int) mp_decode_strl(&buf);
-		mem->flags = MEM_Str | MEM_Ephem;
-install_blob:
-		mem->z = (char *)buf;
-		buf += mem->n;
-		break;
-	}
-	case MP_BIN: {
-		/* XXX u32->int */
-		mem->n = (int) mp_decode_binl(&buf);
-		mem->flags = MEM_Blob | MEM_Ephem;
-		goto install_blob;
-	}
-	case MP_FLOAT: {
-		mem->u.r = mp_decode_float(&buf);
-		mem->flags = sqlIsNaN(mem->u.r) ? MEM_Null : MEM_Real;
-		break;
-	}
-	case MP_DOUBLE: {
-		mem->u.r = mp_decode_double(&buf);
-		mem->flags = sqlIsNaN(mem->u.r) ? MEM_Null : MEM_Real;
-		break;
-	}
-	}
-	*len = (uint32_t)(buf - start_buf);
 	return 0;
 }
 
@@ -2867,16 +2356,9 @@ sqlVdbeRecordUnpackMsgpack(struct key_def *key_def,	/* Information about the rec
 		pMem->szMalloc = 0;
 		pMem->z = 0;
 		uint32_t sz = 0;
-		vdbe_decode_msgpack_into_mem(zParse, pMem, &sz);
-		if (sz == 0) {
-			/* MsgPack array, map or ext. Treat as blob. */
-			pMem->z = (char *)zParse;
-			mp_next(&zParse);
-			pMem->n = zParse - pMem->z;
-			pMem->flags = MEM_Blob | MEM_Ephem;
-		} else {
-			zParse += sz;
-		}
+		mem_from_mp_ephemeral(pMem, zParse, &sz);
+		assert(sz != 0);
+		zParse += sz;
 		pMem++;
 	}
 }

@@ -16,6 +16,7 @@ feedback_host:https://feedback.tarantool.io
 feedback_interval:3600
 force_recovery:false
 hot_standby:false
+iproto_threads:1
 listen:port
 log:tarantool.log
 log_format:plain
@@ -38,6 +39,7 @@ replication_synchro_quorum:1
 replication_synchro_timeout:5
 replication_timeout:1
 slab_alloc_factor:1.05
+slab_alloc_granularity:8
 sql_cache_size:5242880
 strip_core:true
 too_long_threshold:0.5
@@ -52,10 +54,12 @@ vinyl_run_count_per_level:2
 vinyl_run_size_ratio:3.5
 vinyl_timeout:60
 vinyl_write_threads:4
+wal_cleanup_delay:14400
 wal_dir:.
 wal_dir_rescan_delay:2
 wal_max_size:268435456
 wal_mode:write
+wal_queue_max_size:16777216
 worker_pool_threads:4
 --
 -- Test insert from detached fiber

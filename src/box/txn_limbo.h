@@ -95,6 +95,10 @@ struct txn_limbo {
 	 */
 	struct rlist queue;
 	/**
+	 * Number of entries in limbo queue.
+	 */
+	int64_t len;
+	/**
 	 * Instance ID of the owner of all the transactions in the
 	 * queue. Strictly speaking, nothing prevents to store not
 	 * own transactions here, originated from some other
@@ -125,6 +129,24 @@ struct txn_limbo {
 	 * transactions, created on the limbo's owner node.
 	 */
 	struct vclock vclock;
+	/**
+	 * Latest terms received with PROMOTE entries from remote instances.
+	 * Limbo uses them to filter out the transactions coming not from the
+	 * limbo owner, but so outdated that they are rolled back everywhere
+	 * except outdated nodes.
+	 */
+	struct vclock promote_term_map;
+	/**
+	 * The biggest PROMOTE term seen by the instance and persisted in WAL.
+	 * It is related to raft term, but not the same. Synchronous replication
+	 * represented by the limbo is interested only in the won elections
+	 * ended with PROMOTE request.
+	 * It means the limbo's term might be smaller than the raft term, while
+	 * there are ongoing elections, or the leader is already known and this
+	 * instance hasn't read its PROMOTE request yet. During other times the
+	 * limbo and raft are in sync and the terms are the same.
+	 */
+	uint64_t promote_greatest_term;
 	/**
 	 * Maximal LSN gathered quorum and either already confirmed in WAL, or
 	 * whose confirmation is in progress right now. Any attempt to confirm
@@ -190,6 +212,28 @@ txn_limbo_last_entry(struct txn_limbo *limbo)
 }
 
 /**
+ * Return the latest term as seen in PROMOTE requests from instance with id
+ * @a replica_id.
+ */
+static inline uint64_t
+txn_limbo_replica_term(const struct txn_limbo *limbo, uint32_t replica_id)
+{
+	return vclock_get(&limbo->promote_term_map, replica_id);
+}
+
+/**
+ * Check whether replica with id @a source_id is too old to apply synchronous
+ * data from it. The check is only valid when elections are enabled.
+ */
+static inline bool
+txn_limbo_is_replica_outdated(const struct txn_limbo *limbo,
+			      uint32_t replica_id)
+{
+	return txn_limbo_replica_term(limbo, replica_id) <
+	       limbo->promote_greatest_term;
+}
+
+/**
  * Return the last synchronous transaction in the limbo or NULL when it is
  * empty.
  */
@@ -229,7 +273,7 @@ txn_limbo_assign_local_lsn(struct txn_limbo *limbo,
  * remote transactions. The function exists to be used in a
  * context, where a transaction is not known whether it is local
  * or not. For example, when a transaction is committed not bound
- * to any fiber (txn_commit_async()), it can be created by applier
+ * to any fiber (txn_commit_try_async()), it can be created by applier
  * (then it is remote) or by recovery (then it is local). Besides,
  * recovery can commit remote transactions as well, when works on
  * a replica - it will recover data received from master.
@@ -267,15 +311,16 @@ txn_limbo_process(struct txn_limbo *limbo, const struct synchro_request *req);
 int
 txn_limbo_wait_confirm(struct txn_limbo *limbo);
 
+/** Wait until the limbo is empty. Regardless of how its transactions end. */
+int
+txn_limbo_wait_empty(struct txn_limbo *limbo, double timeout);
+
 /**
- * Make txn_limbo confirm all the entries with lsn less than or
- * equal to the given one, and rollback all the following entries.
- * The function makes txn_limbo write CONFIRM and ROLLBACK
- * messages for appropriate lsns, and then process the messages
- * immediately.
+ * Write a PROMOTE request, which has the same effect as CONFIRM(@a lsn) and
+ * ROLLBACK(@a lsn + 1) combined.
  */
 void
-txn_limbo_force_empty(struct txn_limbo *limbo, int64_t last_confirm);
+txn_limbo_write_promote(struct txn_limbo *limbo, int64_t lsn, uint64_t term);
 
 /**
  * Update qsync parameters dynamically.

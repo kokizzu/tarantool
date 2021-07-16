@@ -247,7 +247,7 @@ raft_test_recovery(void)
 static void
 raft_test_bad_msg(void)
 {
-	raft_start_test(9);
+	raft_start_test(11);
 	struct raft_msg msg;
 	struct raft_node node;
 	struct vclock vclock;
@@ -292,6 +292,14 @@ raft_test_bad_msg(void)
 		.vote = 2,
 	};
 	is(raft_node_process_msg(&node, &msg, 2), -1, "bad state");
+	is(node.raft.term, 1, "term from the bad message wasn't used");
+
+	msg = (struct raft_msg){
+		.state = -1,
+		.term = 10,
+		.vote = 2,
+	};
+	is(raft_node_process_msg(&node, &msg, 2), -1, "bad negative state");
 	is(node.raft.term, 1, "term from the bad message wasn't used");
 
 	raft_node_destroy(&node);
@@ -572,7 +580,7 @@ raft_test_vote_skip(void)
 static void
 raft_test_leader_resign(void)
 {
-	raft_start_test(15);
+	raft_start_test(23);
 	struct raft_node node;
 
 	/*
@@ -671,6 +679,84 @@ raft_test_leader_resign(void)
 		1 /* Vote. */,
 		NULL /* Vclock. */
 	), "resign notification is sent");
+
+	/*
+	 * gh-6129: resign of a remote leader during a local WAL write should
+	 * schedule a new election after the WAL write.
+	 *
+	 * Firstly start a new term.
+	 */
+	raft_node_block(&node);
+	raft_node_cfg_is_candidate(&node, true);
+	raft_run_next_event();
+	/* Volatile term is new, but the persistent one is not updated yet. */
+	ok(raft_node_check_full_state(&node,
+		RAFT_STATE_FOLLOWER /* State. */,
+		0 /* Leader. */,
+		2 /* Term. */,
+		1 /* Vote. */,
+		3 /* Volatile term. */,
+		1 /* Volatile vote. */,
+		"{0: 1}" /* Vclock. */
+	), "new election is waiting for WAL write");
+
+	/* Now another node wins the election earlier. */
+	is(raft_node_send_leader(&node,
+		3 /* Term. */,
+		2 /* Source. */
+	), 0, "message is accepted");
+	ok(raft_node_check_full_state(&node,
+		RAFT_STATE_FOLLOWER /* State. */,
+		2 /* Leader. */,
+		2 /* Term. */,
+		1 /* Vote. */,
+		3 /* Volatile term. */,
+		1 /* Volatile vote. */,
+		"{0: 1}" /* Vclock. */
+	), "the leader is accepted");
+
+	/*
+	 * The leader resigns and triggers a new election round on the first
+	 * node. A new election is triggered, but still waiting for the previous
+	 * WAL write to end.
+	 */
+	is(raft_node_send_follower(&node,
+		3 /* Term. */,
+		2 /* Source. */
+	), 0, "message is accepted");
+	/* Note how the volatile term is updated again. */
+	ok(raft_node_check_full_state(&node,
+		RAFT_STATE_FOLLOWER /* State. */,
+		0 /* Leader. */,
+		2 /* Term. */,
+		1 /* Vote. */,
+		4 /* Volatile term. */,
+		1 /* Volatile vote. */,
+		"{0: 1}" /* Vclock. */
+	), "the leader has resigned, new election is scheduled");
+	raft_node_unblock(&node);
+
+	/* Ensure the node still collects votes after the WAL write. */
+	is(raft_node_send_vote_response(&node,
+		4 /* Term. */,
+		1 /* Vote. */,
+		2 /* Source. */
+	), 0, "vote from 2");
+	is(raft_node_send_vote_response(&node,
+		4 /* Term. */,
+		1 /* Vote. */,
+		3 /* Source. */
+	), 0, "vote from 3");
+	raft_run_next_event();
+	ok(raft_node_check_full_state(&node,
+		RAFT_STATE_LEADER /* State. */,
+		1 /* Leader. */,
+		4 /* Term. */,
+		1 /* Vote. */,
+		4 /* Volatile term. */,
+		1 /* Volatile vote. */,
+		"{0: 2}" /* Vclock. */
+	), "the leader is elected");
 
 	raft_node_destroy(&node);
 
@@ -1267,10 +1353,60 @@ raft_test_too_long_wal_write(void)
 	raft_finish_test();
 }
 
+static void
+raft_test_start_stop_candidate(void)
+{
+	raft_start_test(8);
+	struct raft_node node;
+	raft_node_create(&node);
+
+	raft_node_cfg_is_candidate(&node, false);
+	raft_node_cfg_election_quorum(&node, 1);
+
+	raft_node_start_candidate(&node);
+	raft_run_next_event();
+	is(node.raft.state, RAFT_STATE_LEADER, "became leader after "
+	   "start candidate");
+
+	raft_node_stop_candidate(&node);
+	raft_run_for(node.cfg_death_timeout);
+	is(node.raft.state, RAFT_STATE_LEADER, "remain leader after "
+	   "stop candidate");
+
+	raft_node_demote_candidate(&node);
+	is(node.raft.state, RAFT_STATE_FOLLOWER, "demote drops a non-candidate "
+	   "leader to a follower");
+
+	/*
+	 * Ensure the non-candidate leader is demoted when sees a new term, and
+	 * does not try election again.
+	 */
+	raft_node_start_candidate(&node);
+	raft_run_next_event();
+	raft_node_stop_candidate(&node);
+	is(node.raft.state, RAFT_STATE_LEADER, "non-candidate but still "
+	   "leader");
+
+	is(raft_node_send_vote_request(&node,
+		4 /* Term. */,
+		"{}" /* Vclock. */,
+		2 /* Source. */
+	), 0, "vote request from 2");
+	is(node.raft.state, RAFT_STATE_FOLLOWER, "demote once new election "
+	   "starts");
+
+	raft_run_for(node.cfg_election_timeout * 2);
+	is(node.raft.state, RAFT_STATE_FOLLOWER, "still follower");
+	is(node.raft.term, 4, "still the same term");
+
+	raft_node_destroy(&node);
+	raft_finish_test();
+}
+
 static int
 main_f(va_list ap)
 {
-	raft_start_test(13);
+	raft_start_test(14);
 
 	(void) ap;
 	fakeev_init();
@@ -1288,6 +1424,7 @@ main_f(va_list ap)
 	raft_test_death_timeout();
 	raft_test_enable_disable();
 	raft_test_too_long_wal_write();
+	raft_test_start_stop_candidate();
 
 	fakeev_free();
 

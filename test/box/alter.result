@@ -27,34 +27,48 @@ EMPTY_MAP = utils.setmap({})
 -- Test insertion into a system space - verify that
 -- mandatory fields are required.
 --
-_space:insert{_space.id, ADMIN, 'test', 'memtx', 0, EMPTY_MAP, {}}
+err, res = pcall(function() return _space:insert{_space.id, ADMIN, 'test', 'memtx', 0, EMPTY_MAP, {}} end)
 ---
-- error: Duplicate key exists in unique index 'primary' in space '_space'
+...
+assert(res.code == box.error.TUPLE_FOUND)
+---
+- true
 ...
 --
 -- Bad space id
 --
 _space:insert{'hello', 'world', 'test', 'memtx', 0, EMPTY_MAP, {}}
 ---
-- error: 'Tuple field 1 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 1 (id) type does not match one required by operation: expected
+    unsigned, got string'
 ...
 --
 -- Can't create a space which has wrong field count - field_count must be NUM
 --
-_space:insert{_space.id, ADMIN, 'test', 'world', 0, EMPTY_MAP, {}}
+err, res = pcall(function() return _space:insert{_space.id, ADMIN, 'test', 'world', 0, EMPTY_MAP, {}} end)
 ---
-- error: Duplicate key exists in unique index 'primary' in space '_space'
+...
+assert(res.code == box.error.TUPLE_FOUND)
+---
+- true
 ...
 --
 -- There is already a tuple for the system space
 --
-_space:insert{_space.id, ADMIN, '_space', 'memtx', 0, EMPTY_MAP, {}}
+err, res = pcall(function() return _space:insert{_space.id, ADMIN, '_space', 'memtx', 0, EMPTY_MAP, {}} end)
 ---
-- error: Duplicate key exists in unique index 'primary' in space '_space'
+...
+assert(res.code == box.error.TUPLE_FOUND)
+---
+- true
 ...
 _space:insert{_index.id, ADMIN, '_index', 'memtx', 0, EMPTY_MAP, {}}
 ---
-- error: Duplicate key exists in unique index 'primary' in space '_space'
+- error: 'Duplicate key exists in unique index "primary" in space "_space" with old
+    tuple - [288, 1, "_index", "memtx", 0, {}, [{"name": "id", "type": "unsigned"},
+    {"name": "iid", "type": "unsigned"}, {"name": "name", "type": "string"}, {"name":
+    "type", "type": "string"}, {"name": "opts", "type": "map"}, {"name": "parts",
+    "type": "array"}]] and new tuple - [288, 1, "_index", "memtx", 0, {}, []]'
 ...
 --
 -- Can't drop a system space
@@ -139,17 +153,23 @@ space:replace{0}
 ---
 - error: Space '381' does not exist
 ...
-_index:insert{_space.id, 0, 'primary', 'tree', {unique=true}, {{0, 'unsigned'}}}
+err, res = pcall(function() return _index:insert{_space.id, 0, 'primary', 'tree', {unique=true}, {{0, 'unsigned'}}} end)
 ---
-- error: Duplicate key exists in unique index 'primary' in space '_index'
+...
+assert(res.code == box.error.TUPLE_FOUND)
+---
+- true
 ...
 _index:replace{_space.id, 0, 'primary', 'tree', {unique=true}, {{0, 'unsigned'}}}
 ---
 - [280, 0, 'primary', 'tree', {'unique': true}, [[0, 'unsigned']]]
 ...
-_index:insert{_index.id, 0, 'primary', 'tree', {unique=true}, {{0, 'unsigned'}, {1, 'unsigned'}}}
+err, res = pcall(function() return _index:insert{_index.id, 0, 'primary', 'tree', {unique=true}, {{0, 'unsigned'}, {1, 'unsigned'}}} end)
 ---
-- error: Duplicate key exists in unique index 'primary' in space '_index'
+...
+assert(res.code == box.error.TUPLE_FOUND)
+---
+- true
 ...
 _index:replace{_index.id, 0, 'primary', 'tree', {unique=true}, {{0, 'unsigned'}, {1, 'unsigned'}}}
 ---
@@ -436,9 +456,12 @@ space:drop()
 auto = box.schema.space.create('auto_original')
 ---
 ...
-box.schema.space.create('auto', {id = auto.id})
+err, res = pcall(function() return box.schema.space.create('auto', {id = auto.id}) end)
 ---
-- error: Duplicate key exists in unique index 'primary' in space '_space'
+...
+assert(res.code == box.error.TUPLE_FOUND)
+---
+- true
 ...
 box.schema.space.drop('auto')
 ---
@@ -1016,7 +1039,8 @@ s:replace{1}
 ...
 pk:alter{parts = {{1, 'string'}}} -- Must fail.
 ---
-- error: 'Tuple field 1 type does not match one required by operation: expected string'
+- error: 'Tuple field 1 type does not match one required by operation: expected string,
+    got unsigned'
 ...
 s:drop()
 ---
@@ -1520,9 +1544,12 @@ assert(s.name == 'test2')
 ---
 - true
 ...
-s:alter({name = '_space'})
+err, res = pcall(function() return s:alter({name = '_space'}) end)
 ---
-- error: Duplicate key exists in unique index 'name' in space '_space'
+...
+assert(res.code == box.error.TUPLE_FOUND)
+---
+- true
 ...
 s:alter({name = 'test'})
 ---

@@ -351,58 +351,6 @@ sql_stricmp(const char *, const char *);
 int
 sql_strnicmp(const char *, const char *, int);
 
- const void *
-sql_value_blob(sql_value *);
-
-int
-sql_value_bytes(sql_value *);
-
-double
-sql_value_double(sql_value *);
-
-bool
-sql_value_boolean(sql_value *val);
-
-int
-sql_value_int(sql_value *);
-
-/**
- * Get row column subtype.
- * @param stmt row data to process.
- * @param i column index.
- * @retval SQL subtype if any, 0 else.
- */
-enum sql_subtype
-sql_column_subtype(struct sql_stmt *stmt, int i);
-
-sql_int64
-sql_value_int64(sql_value *);
-
-uint64_t
-sql_value_uint64(sql_value *val);
-
-const unsigned char *
-sql_value_text(sql_value *);
-
-/**
- * Return pointer to a string with the data type in the case of
- * binary data stored in @a value. Otherwise, return the result
- * of sql_value_text(). It is used due to the fact that not all
- * binary strings can be displayed correctly (e.g. contain
- * unprintable symbols).
- */
-const char *
-sql_value_to_diag_str(sql_value *value);
-
-enum mp_type
-sql_value_type(sql_value *);
-
-static inline bool
-sql_value_is_null(sql_value *value)
-{
-	return sql_value_type(value) == MP_NIL;
-}
-
 sql *
 sql_context_db_handle(sql_context *);
 
@@ -485,40 +433,12 @@ sql_stmt_compile(const char *sql, int bytes_count, struct Vdbe *re_prepared,
 int
 sql_step(sql_stmt *);
 
-const void *
-sql_column_blob(sql_stmt *, int iCol);
-
-int
-sql_column_bytes(sql_stmt *, int iCol);
-
 int
 sql_column_bytes16(sql_stmt *, int iCol);
 
-double
-sql_column_double(sql_stmt *, int iCol);
-
-int
-sql_column_int(sql_stmt *, int iCol);
-
-bool
-sql_column_boolean(struct sql_stmt *stmt, int column);
-
-sql_int64
-sql_column_int64(sql_stmt *, int iCol);
-
-uint64_t
-sql_column_uint64(struct sql_stmt *stmt, int column);
-
-const unsigned char *
-sql_column_text(sql_stmt *,
-		    int iCol);
-
-enum mp_type
-sql_column_type(sql_stmt *stmt, int field_no);
-
-sql_value *
-sql_column_value(sql_stmt *,
-		     int iCol);
+char *
+sql_stmt_result_to_msgpack(struct sql_stmt *stmt, uint32_t *tuple_size,
+			   struct region *region);
 
 /*
  * Terminate the current execution of an SQL statement and reset
@@ -564,6 +484,13 @@ void *
 sql_aggregate_context(sql_context *,
 			  int nBytes);
 
+/**
+ * Allocate or return the aggregate context containing struct MEM for a user
+ * function. A new context is allocated on the first call. Subsequent calls
+ * return the same context that was returned on prior calls.
+ */
+struct Mem *
+sql_context_agg_mem(struct sql_context *context);
 
 int
 sql_column_count(sql_stmt * pStmt);
@@ -695,10 +622,6 @@ sql_bind_uint64(struct sql_stmt *stmt, int i, uint64_t value);
 
 int
 sql_bind_null(sql_stmt *, int);
-
-int
-sql_bind_text(sql_stmt *, int, const char *, int,
-		  void (*)(void *));
 
 int
 sql_bind_text64(sql_stmt *, int, const char *,
@@ -4000,16 +3923,8 @@ int
 sql_rem_int(int64_t lhs, bool is_lhs_neg, int64_t rhs, bool is_rhs_neg,
 	    int64_t *res, bool *is_res_neg);
 
-const void *sqlValueText(sql_value *);
-int sqlValueBytes(sql_value *);
-void sqlValueSetStr(sql_value *, int, const void *,
-			void (*)(void *));
-void sqlValueSetNull(sql_value *);
-void sqlValueFree(sql_value *);
-sql_value *sqlValueNew(sql *);
 int sqlValueFromExpr(sql *, Expr *, enum field_type type,
 			 sql_value **);
-void sql_value_apply_type(sql_value *val, enum field_type type);
 
 extern const unsigned char sqlOpcodeProperty[];
 extern const unsigned char sqlUpperToLower[];
@@ -4205,31 +4120,38 @@ sql_expr_new_column(struct sql *db, struct SrcList *src_list, int src_idx,
 
 int sqlExprCheckIN(Parse *, Expr *);
 
-int sqlStat4ProbeSetValue(Parse *, struct index_def *, UnpackedRecord **, Expr *, int,
-			      int, int *);
-int sqlStat4ValueFromExpr(Parse *, Expr *, enum field_type type,
-			      sql_value **);
-void sqlStat4ProbeFree(UnpackedRecord *);
+/* TODO: Enable this function when stat-tables will be revived. */
+static inline int
+sqlStat4ProbeSetValue(struct Parse *parse, ...)
+{
+	(void)parse;
+	unreachable();
+	return 0;
+}
 
-/**
- * Extract the col_num-th column from the record.  Write
- * the column value into *res.  If *res is initially NULL
- * then a new sql_value object is allocated.
- *
- * If *res is initially NULL then the caller is responsible for
- * ensuring that the value written into *res is eventually
- * freed.
- *
- * @param db Database handle.
- * @param record Pointer to buffer containing record.
- * @param col_num Column to extract.
- * @param[out] res Extracted value.
- *
- * @retval -1 on error or 0.
- */
-int
-sql_stat4_column(struct sql *db, const char *record, uint32_t col_num,
-		 sql_value **res);
+/* TODO: Enable this function when stat-tables will be revived. */
+static inline int
+sqlStat4ValueFromExpr(struct Parse *parse, ...)
+{
+	(void)parse;
+	unreachable();
+	return 0;
+}
+
+/* TODO: Enable this function when stat-tables will be revived. */
+static inline void
+sqlStat4ProbeFree(struct UnpackedRecord *rec)
+{
+	(void)rec;
+}
+
+/* TODO: Enable this function when stat-tables will be revived. */
+static inline int
+sql_stat4_column(struct sql *db, ...)
+{
+	(void)db;
+	return 0;
+}
 
 /*
  * The interface to the LEMON-generated parser

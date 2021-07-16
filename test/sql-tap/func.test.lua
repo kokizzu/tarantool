@@ -18,7 +18,6 @@ test:plan(14694)
 --
 -- ["set","testdir",[["file","dirname",["argv0"]]]]
 -- ["source",[["testdir"],"\/tester.tcl"]]
-local testprefix = "func"
 -- Create a table to work with.
 --
 test:do_test(
@@ -1048,7 +1047,9 @@ test:do_execsql_test(
 --
 -- MUST_WORK_TEST testfunc not implemented
 if 0 > 0 then
-local DB = sql_connection_pointer("db")
+-- Legacy from the original code. Must be replaced with analogue
+-- functions from box.
+local X = nil
 X(525, "X!cmd", [=[["sql_register_test_function",["::DB"],"testfunc"]]=])
 test:do_catchsql_test(
     "func-10.1",
@@ -1142,6 +1143,17 @@ end
 --
 -- MUST_WORK_TEST test_destructor_count not implemented
 if 0 > 0 then
+local X = nil
+-- Legacy from the original code. Must be replaced with analogue
+-- functions from box.
+local sql_prepare = nil
+local sql_bind_text = nil
+local sql_bind_blob = nil
+local sql_column_text = nil
+local sql_step = nil
+local sql_finalize = nil
+local db = nil
+
 if X(595, "X!cmd", "[\"expr\",\"[db eval {PRAGMA encoding}]==\\\"UTF-8\\\"\"]")
  then
     test:do_execsql_test(
@@ -1300,10 +1312,9 @@ test:do_execsql_test(
 test:do_test(
     "func-13.7",
     function()
-        local DB, sql, STMT, res
-        DB = sql_connection_pointer("db")
+        local sql, STMT, res
         sql = "SELECT test_auxdata( ? , a ) FROM t4;"
-        STMT = sql_prepare(DB, sql, -1, "TAIL")
+        STMT = sql_prepare(sql, -1, "TAIL")
         sql_bind_text(STMT, 1, "hello\0", -1)
         res = {  }
         while X(690, "X!cmd", [=[["expr"," \"sql_ROW\"==[sql_step $STMT] "]]=])
@@ -1349,7 +1360,7 @@ test:do_execsql_test(
         -- </13.8.3>
     })
 
-local V = "one"
+local V = "one" -- luacheck: ignore
 test:do_execsql_test(
     "13.8.4",
     [[
@@ -1455,7 +1466,7 @@ test:do_test(
         test:execsql([[
             CREATE TABLE tbl2(id integer primary key, a INT, b INT);
         ]])
-        local STMT = sql_prepare(DB, "INSERT INTO tbl2 VALUES(1, ?, ?)", -1, "TAIL")
+        local STMT = sql_prepare("INSERT INTO tbl2 VALUES(1, ?, ?)", -1, "TAIL")
         sql_bind_blob(STMT, 1, "abc", 3)
         sql_step(STMT)
         sql_finalize(STMT)
@@ -1473,7 +1484,7 @@ test:do_test(
 test:do_test(
     "func-17.1",
     function()
-        local function testfunc1(args)
+        local function testfunc1(args) -- luacheck: no unused
             X(768, "X!cmd", [=[["error","Error %d with %s percents %p"]]=])
         end
 
@@ -2439,6 +2450,7 @@ test:do_execsql_test(
 --
 -- MUST_WORK_TEST
 if 0>0 then
+local X = nil
 test:do_execsql_test(
     "func-25.1",
     [[
@@ -2470,7 +2482,7 @@ test:do_test(
     "func-26.2",
     function()
         local a = ""
-        for _ in X(0, "X!for", [=[["set i 1","$i<=$::sql_MAX_FUNCTION_ARG","incr i"]]=]) do
+        for i in X(0, "X!for", [=[["set i 1","$i<=$::sql_MAX_FUNCTION_ARG","incr i"]]=]) do
             table.insert(a,i)
         end
         return test:execsql(string.format([[
@@ -2486,7 +2498,7 @@ test:do_test(
     "func-26.3",
     function()
         local a = ""
-        for _ in X(0, "X!for", [=[["set i 1","$i<=$::sql_MAX_FUNCTION_ARG+1","incr i"]]=]) do
+        for i in X(0, "X!for", [=[["set i 1","$i<=$::sql_MAX_FUNCTION_ARG+1","incr i"]]=]) do
             table.insert(a,i)
         end
         return test:catchsql(string.format([[
@@ -2502,7 +2514,7 @@ test:do_test(
     "func-26.4",
     function()
         local a = ""
-        for _ in X(0, "X!for", [=[["set i 1","$i<=$::sql_MAX_FUNCTION_ARG-1","incr i"]]=]) do
+        for i in X(0, "X!for", [=[["set i 1","$i<=$::sql_MAX_FUNCTION_ARG-1","incr i"]]=]) do
             table.insert(a,i)
         end
         return test:catchsql(string.format([[
@@ -2919,7 +2931,7 @@ test:do_catchsql_test(
         SELECT ROUND(X'FF')
     ]], {
         -- <func-76.1>
-        1, "Type mismatch: can not convert varbinary to numeric"
+        1, "Type mismatch: can not convert varbinary(x'FF') to number"
         -- </func-76.1>
     })
 
@@ -2929,7 +2941,7 @@ test:do_catchsql_test(
         SELECT RANDOMBLOB(X'FF')
     ]], {
         -- <func-76.2>
-        1, "Type mismatch: can not convert varbinary to numeric"
+        1, "Type mismatch: can not convert varbinary(x'FF') to number"
         -- </func-76.2>
     })
 
@@ -2939,7 +2951,7 @@ test:do_catchsql_test(
         SELECT SOUNDEX(X'FF')
     ]], {
         -- <func-76.3>
-        1, "Type mismatch: can not convert varbinary to text"
+        1, "Type mismatch: can not convert varbinary(x'FF') to string"
         -- </func-76.3>
     })
 
@@ -2949,7 +2961,7 @@ test:do_catchsql_test(
         SELECT SUM(X'FF')
     ]], {
         -- <func-76.4>
-        1, "Type mismatch: can not convert varbinary to number"
+        1, "Type mismatch: can not convert varbinary(x'FF') to number"
         -- </func-76.4>
     })
 

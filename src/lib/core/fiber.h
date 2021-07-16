@@ -35,7 +35,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "tt_pthread.h"
-#include "third_party/tarantool_ev.h"
+#include <tarantool_ev.h>
 #include "diag.h"
 #include "trivia/util.h"
 #include "small/mempool.h"
@@ -43,13 +43,13 @@
 #include "small/rlist.h"
 #include "salad/stailq.h"
 
-#include <third_party/coro/coro.h>
+#include <coro/coro.h>
 
 /*
  * Fiber top doesn't work on ARM processors at the moment,
  * because we haven't chosen an alternative to rdtsc.
  */
-#ifdef __CC_ARM
+#if !defined(__amd64__) && !defined(__i386__) && !defined(__x86_64__)
 #define ENABLE_FIBER_TOP 0
 #else
 #define ENABLE_FIBER_TOP 1
@@ -162,6 +162,15 @@ enum {
 	 * This flag is set when fiber uses custom stack size.
 	 */
 	FIBER_CUSTOM_STACK	= 1 << 5,
+	/**
+	 * The flag is set for the fiber currently being executed by the cord.
+	 */
+	FIBER_IS_RUNNING	= 1 << 6,
+	/**
+	 * This flag is set when fiber is in the idle list
+	 * of fiber_pool.
+	 */
+	FIBER_IS_IDLE		= 1 << 7,
 	FIBER_DEFAULT_FLAGS = FIBER_IS_CANCELLABLE
 };
 
@@ -279,7 +288,7 @@ API_EXPORT void
 fiber_start(struct fiber *callee, ...);
 
 /**
- * Interrupt a synchronous wait of a fiber
+ * Interrupt a synchronous wait of a fiber. Nop for the currently running fiber.
  *
  * \param f fiber to be woken up
  */
@@ -327,6 +336,22 @@ fiber_set_joinable(struct fiber *fiber, bool yesno);
  */
 API_EXPORT int
 fiber_join(struct fiber *f);
+
+/**
+ * Wait until the fiber is dead or timeout exceeded.
+ * In case timeout == TIMEOUT_INFINITY, this function
+ * same as fiber_join function.
+ * Return fiber execution status to the caller or -1
+ * if timeout exceeded and set diag.
+ * The fiber must not be detached (@sa fiber_set_joinable()).
+ * @pre FIBER_IS_JOINABLE flag is set.
+ *
+ * \param f fiber to be woken up
+ * \param timeout time during which we wait for the fiber completion
+ * \return fiber function ret code or -1 in case if timeout exceeded
+ */
+API_EXPORT int
+fiber_join_timeout(struct fiber *f, double timeout);
 
 /**
  * Put the current fiber to sleep for at least 's' seconds.
@@ -530,7 +555,7 @@ struct fiber {
 	/** Number of context switches. */
 	int csw;
 	/** Fiber id. */
-	uint32_t fid;
+	uint64_t fid;
 	/** Fiber flags */
 	uint32_t flags;
 #if ENABLE_FIBER_TOP
@@ -641,7 +666,7 @@ struct cord {
 	 * Every new fiber gets a new monotonic id. Ids 0 - 100 are
 	 * reserved.
 	 */
-	uint32_t max_fid;
+	uint64_t next_fid;
 #if ENABLE_FIBER_TOP
 	struct clock_stat clock_stat;
 	struct cpu_stat cpu_stat;
@@ -649,7 +674,7 @@ struct cord {
 	pthread_t id;
 	const struct cord_on_exit *on_exit;
 	/** A helper hash to map id -> fiber. */
-	struct mh_i32ptr_t *fiber_registry;
+	struct mh_i64ptr_t *fiber_registry;
 	/** All fibers */
 	struct rlist alive;
 	/** Fibers, ready for execution */
@@ -808,7 +833,7 @@ void
 fiber_call(struct fiber *callee);
 
 struct fiber *
-fiber_find(uint32_t fid);
+fiber_find(uint64_t fid);
 
 void
 fiber_schedule_cb(ev_loop * /* loop */, ev_watcher *watcher, int revents);

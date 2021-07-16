@@ -13,16 +13,16 @@ test:plan(0)
 -------------------------------------------------------------------------
 --
 -- This file contains tests for sql. Specifically, it tests that sql
--- does not crash and an error is returned if localhost() fails. This 
+-- does not crash and an error is returned if localhost() fails. This
 -- is the problem reported by ticket bd484a090c.
 --
 -- ["set","testdir",[["file","dirname",["argv0"]]]]
 -- ["source",[["testdir"],"\/tester.tcl"]]
-local testprefix = "tkt-bd484a090c"
 
 -- Disabled until #3694 is resolved.
 --
-if false then
+local is_gh_3694_closed = false
+if is_gh_3694_closed then
 test:do_test(
     1.1,
     function()

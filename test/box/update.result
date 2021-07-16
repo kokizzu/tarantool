@@ -76,7 +76,7 @@ s:insert{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
 ...
 s:update({0}, {{'#', 42, 1}})
 ---
-- error: Field 42 was not found in the tuple
+- [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 ...
 s:update({0}, {{'#', 4, 'abirvalg'}})
 ---
@@ -261,7 +261,7 @@ s:insert{1684234849}
 ...
 s:update({1684234849}, {{'#', 2, 1}})
 ---
-- error: Field 2 was not found in the tuple
+- [1684234849]
 ...
 s:update({1684234849}, {{'!', -1, 'push1'}})
 ---
@@ -2127,4 +2127,12 @@ s:update({1}, {{'+', 'field3[1].key1.key2[2]', dbl1}})
 ...
 s:drop()
 ---
+...
+--
+-- gh-6069: update of an absent field could crash when had 2 operations in
+-- reversed order both on not specified fields.
+--
+box.tuple.new({1}):update({{'=', 4, 4}, {'=', 3, 3}})
+---
+- [1, null, 3, 4]
 ...

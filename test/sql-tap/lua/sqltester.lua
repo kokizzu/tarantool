@@ -85,6 +85,9 @@ local function is_deeply_regex(got, expected)
         return (got - expected < min_delta) and (expected - got < min_delta)
     end
 
+    -- Legacy from the original code. Must be replaced with analogue
+    -- function.
+    local table_match_regex_p = nil
     if string_regex_p(expected) then
         return table_match_regex_p(got, expected)
     end
@@ -176,7 +179,7 @@ local function execsql(self, sql)
 end
 test.execsql = execsql
 
-local function catchsql(self, sql, expect)
+local function catchsql(self, sql)
     local r = {pcall(execsql, self, sql) }
     if r[1] == true then
         r[1] = 0
@@ -194,6 +197,19 @@ local function do_catchsql_test(self, label, sql, expect)
     return do_test(self, label, function() return catchsql(self, sql) end, expect)
 end
 test.do_catchsql_test = do_catchsql_test
+
+local function do_catchsql_prefix_test(self, label, sql, prefix_end, expect)
+    local function inner()
+        local catch =  catchsql(self, sql)
+        local match = string.find(catch[2], prefix_end)
+        if match ~= nil and match ~= 1 then
+            catch[2] = string.sub(catch[2], 1, match - 1)
+        end
+        return catch
+    end
+    return do_test(self, label, inner, expect)
+end
+test.do_catchsql_prefix_test = do_catchsql_prefix_test
 
 local function do_catchsql2_test(self, label, sql, expect)
     return do_test(self, label, function() return test.catchsql2(self, sql) end, expect)
@@ -272,7 +288,7 @@ test.catchsql2 = catchsql2
 -- that different SQL statements generate exactly the same VDBE code.
 local function explain_no_trace(self, sql)
     local tr = execsql(self, "EXPLAIN "..sql)
-    for i=1,8 do
+    for _=1,8 do
         table.remove(tr,1)
     end
     return tr
@@ -378,7 +394,6 @@ function test.randstr(Length)
     for Loop = 0, 255 do
         Chars[Loop+1] = string.char(Loop)
     end
-    local String = table.concat(Chars)
     local Result = {}
     local Lookup = Chars
     local Range = #Lookup

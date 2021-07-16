@@ -35,7 +35,7 @@ test:plan(79)
 --
 -- Verify the default settings for full_column_name
 --
-local function lreplace(arr, pos, len, val)
+local function lreplace(arr, pos, len, val) -- luacheck: no unused
     for i = pos + 1, pos + len + 1, 1 do
         arr[i] = val
     end
@@ -64,7 +64,7 @@ test:do_test(
             INSERT INTO txyz VALUES(4,5,6);
             CREATE TABLE tboth(a INT PRIMARY KEY,b INT,c INT,x INT,y INT,z INT);
             INSERT INTO tboth VALUES(11,12,13,14,15,16);
-            CREATE VIEW v1 AS SELECT tabC.a, txyZ.x, * 
+            CREATE VIEW v1 AS SELECT tabC.a, txyZ.x, *
               FROM tabc, txyz ORDER BY 1 LIMIT 1;
             CREATE VIEW v2 AS SELECT tabC.a, txyZ.x, tboTh.a, tbotH.x, *
               FROM tabc, txyz, tboth ORDER BY 1 LIMIT 1;
@@ -166,7 +166,7 @@ test:do_test(
             UPDATE "_session_settings" SET "value" = false WHERE "name" = 'sql_full_column_names';
             CREATE VIEW v3 AS SELECT tabC.a, txyZ.x, *
               FROM tabc, txyz ORDER BY 1 LIMIT 1;
-            CREATE VIEW v4 AS SELECT tabC.a, txyZ.x, tboTh.a, tbotH.x, * 
+            CREATE VIEW v4 AS SELECT tabC.a, txyZ.x, tboTh.a, tbotH.x, *
               FROM tabc, txyz, tboth ORDER BY 1 LIMIT 1;
         ]]
         return test:execsql2 [[
@@ -286,7 +286,7 @@ test:do_test(
             UPDATE "_session_settings" SET "value" = true WHERE "name" = 'sql_full_column_names';
             CREATE VIEW v5 AS SELECT tabC.a, txyZ.x, *
               FROM tabc, txyz ORDER BY 1 LIMIT 1;
-            CREATE VIEW v6 AS SELECT tabC.a, txyZ.x, tboTh.a, tbotH.x, * 
+            CREATE VIEW v6 AS SELECT tabC.a, txyZ.x, tboTh.a, tbotH.x, *
               FROM tabc, txyz, tboth ORDER BY 1 LIMIT 1;
         ]]
         return test:execsql2 [[
@@ -435,8 +435,6 @@ test:do_execsql2_test(
 test:do_test(
     "colname-6.1",
     function()
-        --db("close")
-        --sql("db", "test.db")
         -- instead of reconnect to database
         -- we are just turning settings to default state
         test:execsql([[

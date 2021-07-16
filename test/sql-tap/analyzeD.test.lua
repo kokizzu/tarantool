@@ -2,8 +2,6 @@
 local test = require("sqltester")
 test:plan(15)
 
-local testprefix = "analyzeD"
-
 --!./tcltestrunner.lua
 -- 2005 July 22
 --
@@ -56,8 +54,6 @@ test:do_test(
 			ANALYZE;
 		]])
 	end, {
-        	-- <1.1> 
-        	-- </1.1>
     })
 
 -- With full ANALYZE data, sql sees that c=150 (5 rows) is better than
@@ -103,7 +99,7 @@ test:do_execsql_test(
 		UPDATE t1 SET a=13 WHERE a = 3001;
 		ANALYZE;
 	]], {
-        -- <1.5> 
+        -- <1.5>
         -- </1.5>
     })
 
@@ -122,11 +118,11 @@ test:do_test(
 	function()
 		test:execsql(" DELETE FROM \"_sql_stat1\" ")
 	end, {
-        -- <1.7> 
+        -- <1.7>
         -- </1.7>
-   	})
+        })
 
--- Same test as 1.4, except this time the 7 rows that match the a=? condition 
+-- Same test as 1.4, except this time the 7 rows that match the a=? condition
 -- do not feature larger values than all rows in the stat4 table. So sql
 -- gets this right, even without stat1 data.
 test:do_execsql_test(
@@ -137,7 +133,7 @@ test:do_execsql_test(
         -- <1.8>
         0, 0, 0, "SEARCH TABLE T1 USING COVERING INDEX T1_C (C=?)"
         -- </1.8>
-   	})
+        })
 
 test:do_catchsql_test(
 	"analyzeD-1.9",
@@ -157,7 +153,7 @@ test:do_execsql_test(
 		SELECT * FROM "_sql_stat4" WHERE "tbl" = 'v';
 	]], {
 		-- <analyzeD-1.10>
-		
+
 		-- <analyzeD-1.10>
 	})
 
@@ -167,7 +163,7 @@ test:do_execsql_test(
 		SELECT * FROM "_sql_stat1" WHERE "tbl" = 'v';
 	]], {
 		-- <analyzeD-1.11>
-		
+
 		-- <analyzeD-1.11>
 	})
 
@@ -187,7 +183,7 @@ test:do_execsql_test(
 		SELECT * FROM "_sql_stat4" WHERE "tbl" = 'v';
 	]], {
 		-- <analyzeD-1.13>
-		
+
 		-- <analyzeD-1.13>
 	})
 
@@ -197,7 +193,7 @@ test:do_execsql_test(
 		SELECT * FROM "_sql_stat1" WHERE "tbl" = 'v';
 	]], {
 		-- <analyzeD-1.14>
-		
+
 		-- <analyzeD-1.14>
 	})
 

@@ -52,21 +52,23 @@ lua_source(lua_sources lua/httpc.lua)
 lua_source(lua_sources lua/iconv.lua)
 lua_source(lua_sources lua/swim.lua)
 # LuaJIT jit.* library
-lua_source(lua_sources "${CMAKE_BINARY_DIR}/third_party/luajit/src/jit/bc.lua")
-lua_source(lua_sources "${CMAKE_BINARY_DIR}/third_party/luajit/src/jit/bcsave.lua")
-lua_source(lua_sources "${CMAKE_BINARY_DIR}/third_party/luajit/src/jit/dis_x86.lua")
-lua_source(lua_sources "${CMAKE_BINARY_DIR}/third_party/luajit/src/jit/dis_x64.lua")
-lua_source(lua_sources "${CMAKE_BINARY_DIR}/third_party/luajit/src/jit/dump.lua")
-lua_source(lua_sources "${CMAKE_BINARY_DIR}/third_party/luajit/src/jit/vmdef.lua")
-lua_source(lua_sources "${CMAKE_BINARY_DIR}/third_party/luajit/src/jit/v.lua")
-lua_source(lua_sources "${CMAKE_BINARY_DIR}/third_party/luajit/src/jit/p.lua")
-lua_source(lua_sources "${CMAKE_BINARY_DIR}/third_party/luajit/src/jit/zone.lua")
+lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/src/jit/bc.lua)
+lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/src/jit/bcsave.lua)
+lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/src/jit/dis_arm64.lua)
+lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/src/jit/dis_x86.lua)
+lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/src/jit/dis_x64.lua)
+lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/src/jit/dump.lua)
+lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/src/jit/v.lua)
+lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/src/jit/p.lua)
+lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/src/jit/zone.lua)
+lua_source(lua_sources ${LUAJIT_BINARY_ROOT}/src/jit/vmdef.lua)
 # LuaJIT tools.* library
-lua_source(lua_sources "${CMAKE_BINARY_DIR}/third_party/luajit/tools/memprof.lua")
-lua_source(lua_sources "${CMAKE_BINARY_DIR}/third_party/luajit/tools/memprof/humanize.lua")
-lua_source(lua_sources "${CMAKE_BINARY_DIR}/third_party/luajit/tools/memprof/parse.lua")
-lua_source(lua_sources "${CMAKE_BINARY_DIR}/third_party/luajit/tools/utils/bufread.lua")
-lua_source(lua_sources "${CMAKE_BINARY_DIR}/third_party/luajit/tools/utils/symtab.lua")
+lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/tools/memprof.lua)
+lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/tools/memprof/humanize.lua)
+lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/tools/memprof/parse.lua)
+lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/tools/memprof/process.lua)
+lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/tools/utils/bufread.lua)
+lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/tools/utils/symtab.lua)
 
 add_custom_target(generate_lua_sources
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/src/box
@@ -94,9 +96,11 @@ add_library(cpu_feature STATIC cpu_feature.c)
 
 add_library(crc32 STATIC
     crc32.c
-    ${PROJECT_SOURCE_DIR}/third_party/crc32.c
+    ${PROJECT_SOURCE_DIR}/third_party/crc32_impl.c
 )
 target_link_libraries(crc32 cpu_feature)
+
+add_library(shutdown STATIC on_shutdown.c)
 
 set (server_sources
      find_path.c
@@ -107,6 +111,7 @@ set (server_sources
      title.c
      proc_title.c
      path_lock.c
+     ssl_cert_paths_discover.c
      systemd.c
      version.c
      lua/digest.c
@@ -117,6 +122,7 @@ set (server_sources
      lua/trigger.c
      lua/msgpack.c
      lua/utils.c
+     lua/serializer.c
      lua/errno.c
      lua/tnt_iconv.c
      lua/error.c
@@ -128,7 +134,6 @@ set (server_sources
      lua/utf8.c
      lua/info.c
      lua/string.c
-     lua/buffer.c
      lua/swim.c
      lua/decimal.c
      ${lua_sources}
@@ -141,6 +146,7 @@ set (server_sources
 set(api_headers
     ${CMAKE_BINARY_DIR}/src/trivia/config.h
     ${CMAKE_SOURCE_DIR}/src/trivia/util.h
+    ${CMAKE_SOURCE_DIR}/src/on_shutdown.h
     ${CMAKE_SOURCE_DIR}/src/lib/core/say.h
     ${CMAKE_SOURCE_DIR}/src/lib/core/fiber.h
     ${CMAKE_SOURCE_DIR}/src/lib/core/fiber_cond.h
@@ -186,7 +192,7 @@ target_link_libraries(server core coll http_parser bit uri uuid swim swim_udp
 # Rule of thumb: if exporting a symbol from a static library, list the
 # library here.
 set (reexport_libraries server core misc bitset csv swim swim_udp swim_ev
-     ${LUAJIT_LIBRARIES} ${MSGPUCK_LIBRARIES} ${ICU_LIBRARIES})
+     shutdown ${LUAJIT_LIBRARIES} ${MSGPUCK_LIBRARIES} ${ICU_LIBRARIES})
 
 set (common_libraries
     ${reexport_libraries}
@@ -195,6 +201,7 @@ set (common_libraries
     ${CURL_LIBRARIES}
     ${ICONV_LIBRARIES}
     ${OPENSSL_LIBRARIES}
+    ${XXHASH_LIBRARIES}
 )
 
 if (TARGET_OS_LINUX OR TARGET_OS_DEBIAN_FREEBSD)

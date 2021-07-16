@@ -71,7 +71,7 @@ test:do_test(
         --execsql {SELECT name FROM sql_master WHERE type!='meta' ORDER BY name}
     end, {
         -- <index-1.2>
-        
+
         -- </index-1.2>
     })
 
@@ -106,7 +106,6 @@ test:do_test(
 test:do_test(
     "index-2.2",
     function()
-        local msg
         local v , msg= pcall(function()
             test:execsql("CREATE INDEX index1 ON test1(f1, f2, f4, f3)")
             end)
@@ -259,7 +258,7 @@ test:do_test(
         --execsql {SELECT name FROM sql_master WHERE type!='meta' ORDER BY name}
     end, {
         -- <index-4.13>
-        
+
         -- </index-4.13>
     })
 
@@ -283,7 +282,7 @@ test:do_test(
         return test:execsql "CREATE INDEX index1 ON test1(f1)"
     end, {
         -- <index-6.1>
-        
+
         -- </index-6.1>
     })
 
@@ -332,7 +331,7 @@ test:do_test(
         --execsql {SELECT name FROM sql_master WHERE type!='meta' ORDER BY name}
     end, {
         -- <index-6.3>
-        
+
         -- </index-6.3>
     })
 
@@ -347,7 +346,7 @@ test:do_execsql_test(
         SELECT "name" FROM "_space" WHERE "name"='TEST1';
     ]], {
         -- <index-6.4>
-        
+
         -- </index-6.4>
     })
 
@@ -397,7 +396,7 @@ test:do_test(
         return test:execsql [[SELECT "name" FROM "_space" WHERE "name"='TEST1']]
     end, {
         -- <index-7.4>
-        
+
         -- </index-7.4>
     })
 
@@ -407,7 +406,7 @@ test:do_test(
 test:do_catchsql_test(
     "index-8.1",
     [[
-    	CREATE TABLE test1(a INT PRIMARY KEY);
+        CREATE TABLE test1(a INT PRIMARY KEY);
         DROP INDEX index1 ON test1
     ]], {
         -- <index-8.1>
@@ -492,7 +491,7 @@ test:do_execsql_test(
         SELECT b FROM t1 WHERE a=1 ORDER BY b;
     ]], {
         -- <index-10.3>
-        
+
         -- </index-10.3>
     })
 
@@ -550,7 +549,7 @@ test:do_execsql_test(
         SELECT b FROM t1 WHERE a=1 ORDER BY b;
     ]], {
         -- <index-10.7>
-        
+
         -- </index-10.7>
     })
 
@@ -585,7 +584,9 @@ test:do_test(
         for i = 1, 50, 1 do
             test:execsql(string.format("INSERT INTO t3 VALUES('x%sx',%s,0.%s)", i, i, i))
         end
-        local sql_search_count = 0
+        -- Legacy from the original code. Must be replaced with analogue
+        -- functions from box.
+        local X = nil
         return X(381, "X!cmd", [=[["concat",[["execsql","SELECT c FROM t3 WHERE b==10"]],["sql_search_count"]]]=])
     end, {
         -- <index-11.1>
@@ -777,7 +778,7 @@ test:do_catchsql_test(
         SELECT c FROM t6 WHERE a>123;
     ]], {
         -- <index-14.6>
-        1, "Type mismatch: can not convert  to numeric"
+        1, "Type mismatch: can not convert string('') to number"
         -- </index-14.6>
     })
 
@@ -787,7 +788,7 @@ test:do_catchsql_test(
         SELECT c FROM t6 WHERE a>=123;
     ]], {
         -- <index-14.7>
-        1, "Type mismatch: can not convert  to numeric"
+        1, "Type mismatch: can not convert string('') to number"
         -- </index-14.7>
     })
 
@@ -839,7 +840,7 @@ test:do_execsql_test(
         SELECT * FROM t1;
     ]], {
         -- <index-15.1>
-        
+
         -- </index-15.1>
     })
 

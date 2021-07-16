@@ -53,9 +53,6 @@ txn_on_stop(struct trigger *trigger, void *event);
 static int
 txn_on_yield(struct trigger *trigger, void *event);
 
-static void
-txn_run_rollback_triggers(struct txn *txn, struct rlist *triggers);
-
 static int
 txn_add_redo(struct txn *txn, struct txn_stmt *stmt, struct request *request)
 {
@@ -76,6 +73,7 @@ txn_add_redo(struct txn *txn, struct txn_stmt *stmt, struct request *request)
 		row->lsn = 0;
 		row->sync = 0;
 		row->tm = 0;
+		row->flags = 0;
 	}
 	/*
 	 * Group ID should be set both for requests not having a
@@ -148,8 +146,10 @@ txn_rollback_one_stmt(struct txn *txn, struct txn_stmt *stmt)
 {
 	if (txn->engine != NULL && stmt->space != NULL)
 		engine_rollback_statement(txn->engine, txn, stmt);
-	if (stmt->has_triggers)
-		txn_run_rollback_triggers(txn, &stmt->on_rollback);
+	if (stmt->has_triggers && trigger_run(&stmt->on_rollback, txn) != 0) {
+		diag_log();
+		panic("statement rollback trigger failed");
+	}
 }
 
 static void
@@ -200,6 +200,8 @@ txn_new(void)
 	assert(region_used(&region) == sizeof(*txn));
 	txn->region = region;
 	rlist_create(&txn->read_set);
+	rlist_create(&txn->point_holes_list);
+	rlist_create(&txn->gap_list);
 	rlist_create(&txn->conflict_list);
 	rlist_create(&txn->conflicted_by_list);
 	rlist_create(&txn->in_read_view_txs);
@@ -212,6 +214,7 @@ txn_new(void)
 inline static void
 txn_free(struct txn *txn)
 {
+	memtx_tx_clean_txn(txn);
 	struct tx_read_tracker *tracker, *tmp;
 	rlist_foreach_entry_safe(tracker, &txn->read_set,
 				 in_read_set, tmp) {
@@ -245,6 +248,31 @@ txn_free(struct txn *txn)
 	stailq_add(&txn_cache, &txn->in_txn_cache);
 }
 
+void
+diag_set_txn_sign_detailed(const char *file, unsigned line, int64_t signature)
+{
+	if (signature >= JOURNAL_ENTRY_ERR_MIN)
+		return diag_set_journal_res_detailed(file, line, signature);
+	switch(signature) {
+	case TXN_SIGNATURE_ROLLBACK:
+		diag_set_detailed(file, line, ClientError, ER_TXN_ROLLBACK);
+		return;
+	case TXN_SIGNATURE_QUORUM_TIMEOUT:
+		diag_set_detailed(file, line, ClientError,
+				  ER_SYNC_QUORUM_TIMEOUT);
+		return;
+	case TXN_SIGNATURE_SYNC_ROLLBACK:
+		diag_set_detailed(file, line, ClientError, ER_SYNC_ROLLBACK);
+		return;
+	case TXN_SIGNATURE_ABORT:
+		if (diag_is_empty(diag_get()))
+			panic("Tried to get an absent transaction error");
+		return;
+	}
+	panic("Transaction signature %lld can't be converted to an error "
+	      "at %s:%u", (long long)signature, file, line);
+}
+
 struct txn *
 txn_begin(void)
 {
@@ -267,7 +295,7 @@ txn_begin(void)
 	txn->psn = 0;
 	txn->rv_psn = 0;
 	txn->status = TXN_INPROGRESS;
-	txn->signature = TXN_SIGNATURE_ROLLBACK;
+	txn->signature = TXN_SIGNATURE_UNKNOWN;
 	txn->engine = NULL;
 	txn->engine_tx = NULL;
 	txn->fk_deferred_count = 0;
@@ -282,7 +310,7 @@ txn_begin(void)
 	 * It's a responsibility of an engine to disable yields
 	 * if they are not supported.
 	 */
-	txn_set_flag(txn, TXN_CAN_YIELD);
+	txn_set_flags(txn, TXN_CAN_YIELD);
 	return txn;
 }
 
@@ -306,7 +334,7 @@ txn_begin_in_engine(struct engine *engine, struct txn *txn)
 }
 
 int
-txn_begin_stmt(struct txn *txn, struct space *space)
+txn_begin_stmt(struct txn *txn, struct space *space, uint16_t type)
 {
 	assert(txn == in_txn());
 	assert(txn != NULL);
@@ -340,6 +368,7 @@ txn_begin_stmt(struct txn *txn, struct space *space)
 		goto fail;
 
 	stmt->space = space;
+	stmt->type = type;
 	if (engine_begin_statement(engine, txn) != 0)
 		goto fail;
 
@@ -418,25 +447,7 @@ txn_commit_stmt(struct txn *txn, struct request *request)
 			 */
 			stmt->does_require_old_tuple = true;
 
-			int rc = 0;
-			if(!space_is_temporary(stmt->space)) {
-				rc = trigger_run(&stmt->space->on_replace, txn);
-			} else {
-				/*
-				 * There is no row attached to txn_stmt for
-				 * temporary spaces, since DML operations on
-				 * them are not written to WAL.
-				 * Fake a row to pass operation type to lua
-				 * on_replace triggers.
-				 */
-				assert(stmt->row == NULL);
-				struct xrow_header temp_header;
-				temp_header.type = request->type;
-				stmt->row = &temp_header;
-				rc = trigger_run(&stmt->space->on_replace, txn);
-				stmt->row = NULL;
-			}
-			if (rc != 0)
+			if(trigger_run(&stmt->space->on_replace, txn) != 0)
 				goto fail;
 		}
 	}
@@ -445,45 +456,6 @@ txn_commit_stmt(struct txn *txn, struct request *request)
 fail:
 	txn_rollback_stmt(txn);
 	return -1;
-}
-
-/*
- * A helper function to process on_commit triggers.
- */
-static void
-txn_run_commit_triggers(struct txn *txn, struct rlist *triggers)
-{
-	/*
-	 * Commit triggers must be run in the same order they
-	 * were added so that a trigger sees the changes done
-	 * by previous triggers (this is vital for DDL).
-	 */
-	if (trigger_run_reverse(triggers, txn) != 0) {
-		/*
-		 * As transaction couldn't handle a trigger error so
-		 * there is no option except panic.
-		 */
-		diag_log();
-		unreachable();
-		panic("commit trigger failed");
-	}
-}
-
-/*
- * A helper function to process on_rollback triggers.
- */
-static void
-txn_run_rollback_triggers(struct txn *txn, struct rlist *triggers)
-{
-	if (trigger_run(triggers, txn) != 0) {
-		/*
-		 * As transaction couldn't handle a trigger error so
-		 * there is no option except panic.
-		 */
-		diag_log();
-		unreachable();
-		panic("rollback trigger failed");
-	}
 }
 
 /* A helper function to process on_wal_write triggers. */
@@ -516,10 +488,8 @@ txn_free_or_wakeup(struct txn *txn)
 	if (txn->fiber == NULL)
 		txn_free(txn);
 	else {
-		txn_set_flag(txn, TXN_IS_DONE);
-		if (txn->fiber != fiber())
-			/* Wake a waiting fiber up. */
-			fiber_wakeup(txn->fiber);
+		txn_set_flags(txn, TXN_IS_DONE);
+		fiber_wakeup(txn->fiber);
 	}
 }
 
@@ -528,6 +498,7 @@ txn_complete_fail(struct txn *txn)
 {
 	assert(!txn_has_flag(txn, TXN_IS_DONE));
 	assert(txn->signature < 0);
+	assert(txn->signature != TXN_SIGNATURE_UNKNOWN);
 	txn->status = TXN_ABORTED;
 	struct txn_stmt *stmt;
 	stailq_reverse(&txn->stmts);
@@ -535,8 +506,16 @@ txn_complete_fail(struct txn *txn)
 		txn_rollback_one_stmt(txn, stmt);
 	if (txn->engine != NULL)
 		engine_rollback(txn->engine, txn);
-	if (txn_has_flag(txn, TXN_HAS_TRIGGERS))
-		txn_run_rollback_triggers(txn, &txn->on_rollback);
+	if (txn_has_flag(txn, TXN_HAS_TRIGGERS)) {
+		if (trigger_run(&txn->on_rollback, txn) != 0) {
+			diag_log();
+			panic("transaction rollback trigger failed");
+		}
+		/* Can't rollback more than once. */
+		trigger_destroy(&txn->on_rollback);
+		/* Commit won't happen after rollback. */
+		trigger_destroy(&txn->on_commit);
+	}
 	txn_free_or_wakeup(txn);
 }
 
@@ -549,8 +528,21 @@ txn_complete_success(struct txn *txn)
 	txn->status = TXN_COMMITTED;
 	if (txn->engine != NULL)
 		engine_commit(txn->engine, txn);
-	if (txn_has_flag(txn, TXN_HAS_TRIGGERS))
-		txn_run_commit_triggers(txn, &txn->on_commit);
+	if (txn_has_flag(txn, TXN_HAS_TRIGGERS)) {
+		/*
+		 * Commit triggers must be run in the same order they were added
+		 * so that a trigger sees the changes done by previous triggers
+		 * (this is vital for DDL).
+		 */
+		if (trigger_run_reverse(&txn->on_commit, txn) != 0) {
+			diag_log();
+			panic("transaction commit trigger failed");
+		}
+		/* Can't commit more than once. */
+		trigger_destroy(&txn->on_commit);
+		/* Rollback won't happen after commit. */
+		trigger_destroy(&txn->on_rollback);
+	}
 	txn_free_or_wakeup(txn);
 }
 
@@ -559,14 +551,7 @@ static void
 txn_on_journal_write(struct journal_entry *entry)
 {
 	struct txn *txn = entry->complete_data;
-	/*
-	 * txn_limbo has already rolled the tx back, so we just
-	 * have to free it.
-	 */
-	if (txn->signature < TXN_SIGNATURE_ROLLBACK) {
-		txn_free(txn);
-		return;
-	}
+	assert(txn->signature == TXN_SIGNATURE_UNKNOWN);
 	txn->signature = entry->res;
 	/*
 	 * Some commit/rollback triggers require for in_txn fiber
@@ -585,13 +570,14 @@ txn_on_journal_write(struct journal_entry *entry)
 		int n_rows = txn->n_new_rows + txn->n_applier_rows;
 		say_warn_ratelimited("too long WAL write: %d rows at LSN %lld: "
 				     "%.3f sec", n_rows,
-				     txn->signature - n_rows + 1, delta);
+				     (long long)(txn->signature - n_rows + 1),
+				     delta);
 	}
 	if (txn_has_flag(txn, TXN_HAS_TRIGGERS))
 		txn_run_wal_write_triggers(txn);
 	if (!txn_has_flag(txn, TXN_WAIT_SYNC))
 		txn_complete_success(txn);
-	else if (txn->fiber != NULL && txn->fiber != fiber())
+	else if (txn->fiber != NULL)
 		fiber_wakeup(txn->fiber);
 finish:
 	fiber_set_txn(fiber(), NULL);
@@ -614,6 +600,14 @@ txn_journal_entry_new(struct txn *txn)
 	struct xrow_header **remote_row = req->rows;
 	struct xrow_header **local_row = req->rows + txn->n_applier_rows;
 	bool is_sync = false;
+	/*
+	 * A transaction which consists of NOPs solely should pass through the
+	 * limbo without waiting. Even when the limbo is not empty. This is
+	 * because otherwise they might fail with the limbo being not owned by
+	 * the NOPs owner. But it does not matter, because they just need to
+	 * bump vclock. There is nothing to confirm or rollback in them.
+	 */
+	bool is_fully_nop = true;
 
 	stailq_foreach_entry(stmt, &txn->stmts, next) {
 		if (stmt->has_triggers) {
@@ -625,8 +619,11 @@ txn_journal_entry_new(struct txn *txn)
 		if (stmt->row == NULL)
 			continue;
 
-		is_sync = is_sync || (stmt->space != NULL &&
-				      stmt->space->def->opts.is_sync);
+		if (stmt->row->type != IPROTO_NOP) {
+			is_fully_nop = false;
+			is_sync = is_sync || (stmt->space != NULL &&
+					      stmt->space->def->opts.is_sync);
+		}
 
 		if (stmt->row->replica_id == 0)
 			*local_row++ = stmt->row;
@@ -640,10 +637,9 @@ txn_journal_entry_new(struct txn *txn)
 	 * space can't be synchronous. So if there is at least one
 	 * synchronous space, the transaction is not local.
 	 */
-	if (!txn_has_flag(txn, TXN_FORCE_ASYNC)) {
+	if (!txn_has_flag(txn, TXN_FORCE_ASYNC) && !is_fully_nop) {
 		if (is_sync) {
-			txn_set_flag(txn, TXN_WAIT_SYNC);
-			txn_set_flag(txn, TXN_WAIT_ACK);
+			txn_set_flags(txn, TXN_WAIT_SYNC | TXN_WAIT_ACK);
 		} else if (!txn_limbo_is_empty(&txn_limbo)) {
 			/*
 			 * There some sync entries on the
@@ -652,7 +648,7 @@ txn_journal_entry_new(struct txn *txn)
 			 * doesn't touch sync space (each sync txn
 			 * should be considered as a barrier).
 			 */
-			txn_set_flag(txn, TXN_WAIT_SYNC);
+			txn_set_flags(txn, TXN_WAIT_SYNC);
 		}
 	}
 
@@ -681,6 +677,14 @@ txn_journal_entry_new(struct txn *txn)
 	} else {
 		--req->n_rows;
 	}
+
+	static const uint8_t flags_map[] = {
+		[TXN_WAIT_SYNC] = IPROTO_FLAG_WAIT_SYNC,
+		[TXN_WAIT_ACK] = IPROTO_FLAG_WAIT_ACK,
+	};
+
+	req->flags |= flags_map[txn->flags & TXN_WAIT_SYNC];
+	req->flags |= flags_map[txn->flags & TXN_WAIT_ACK];
 
 	return req;
 }
@@ -782,7 +786,7 @@ txn_limbo_on_rollback(struct trigger *trig, void *event)
 	(void) event;
 	struct txn *txn = (struct txn *) event;
 	/* Check whether limbo has performed the cleanup. */
-	if (txn->signature != TXN_SIGNATURE_ROLLBACK)
+	if (!txn_has_flag(txn, TXN_WAIT_SYNC))
 		return 0;
 	struct txn_limbo_entry *entry = (struct txn_limbo_entry *) trig->data;
 	txn_limbo_abort(&txn_limbo, entry);
@@ -790,18 +794,13 @@ txn_limbo_on_rollback(struct trigger *trig, void *event)
 }
 
 int
-txn_commit_async(struct txn *txn)
+txn_commit_try_async(struct txn *txn)
 {
 	struct journal_entry *req;
 
 	ERROR_INJECT(ERRINJ_TXN_COMMIT_ASYNC, {
 		diag_set(ClientError, ER_INJECTION,
 			 "txn commit async injection");
-		/*
-		 * Log it for the testing sake: we grep
-		 * output to mark this event.
-		 */
-		diag_log();
 		goto rollback;
 	});
 
@@ -860,9 +859,8 @@ txn_commit_async(struct txn *txn)
 	}
 
 	fiber_set_txn(fiber(), NULL);
-	if (journal_write_async(req) != 0) {
+	if (journal_write_try_async(req) != 0) {
 		fiber_set_txn(fiber(), txn);
-		diag_set(ClientError, ER_WAL_IO);
 		diag_log();
 		goto rollback;
 	}
@@ -871,7 +869,7 @@ txn_commit_async(struct txn *txn)
 
 rollback:
 	assert(txn->fiber == NULL);
-	txn_rollback(txn);
+	txn_abort(txn);
 	return -1;
 }
 
@@ -884,7 +882,7 @@ txn_commit(struct txn *txn)
 	txn->fiber = fiber();
 
 	if (txn_prepare(txn) != 0)
-		goto rollback;
+		goto rollback_abort;
 
 	if (txn_commit_nop(txn)) {
 		txn_free(txn);
@@ -893,10 +891,15 @@ txn_commit(struct txn *txn)
 
 	req = txn_journal_entry_new(txn);
 	if (req == NULL)
-		goto rollback;
-
-	bool is_sync = txn_has_flag(txn, TXN_WAIT_SYNC);
-	if (is_sync) {
+		goto rollback_abort;
+	/*
+	 * Do not cache the flag value in a variable. The flag might be deleted
+	 * during WAL write. This can happen for async transactions created
+	 * during CONFIRM write, whose all blocking sync transactions get
+	 * confirmed. Then they turn the async transaction into just a plain
+	 * txn not waiting for anything.
+	 */
+	if (txn_has_flag(txn, TXN_WAIT_SYNC)) {
 		/*
 		 * Remote rows, if any, come before local rows, so
 		 * check for originating instance id here.
@@ -910,18 +913,17 @@ txn_commit(struct txn *txn)
 		 */
 		limbo_entry = txn_limbo_append(&txn_limbo, origin_id, txn);
 		if (limbo_entry == NULL)
-			goto rollback;
+			goto rollback_abort;
 	}
 
 	fiber_set_txn(fiber(), NULL);
-	if (journal_write(req) != 0 || req->res < 0) {
-		if (is_sync)
-			txn_limbo_abort(&txn_limbo, limbo_entry);
-		diag_set(ClientError, ER_WAL_IO);
-		diag_log();
-		goto rollback;
+	if (journal_write(req) != 0)
+		goto rollback_io;
+	if (req->res < 0) {
+		diag_set_journal_res(req->res);
+		goto rollback_io;
 	}
-	if (is_sync) {
+	if (txn_has_flag(txn, TXN_WAIT_SYNC)) {
 		if (txn_has_flag(txn, TXN_WAIT_ACK)) {
 			int64_t lsn = req->rows[req->n_rows - 1]->lsn;
 			/*
@@ -944,7 +946,14 @@ txn_commit(struct txn *txn)
 	txn_free(txn);
 	return 0;
 
+rollback_io:
+	diag_log();
+	if (txn_has_flag(txn, TXN_WAIT_SYNC))
+		txn_limbo_abort(&txn_limbo, limbo_entry);
+rollback_abort:
+	txn->signature = TXN_SIGNATURE_ABORT;
 rollback:
+	assert(txn->signature != TXN_SIGNATURE_UNKNOWN);
 	assert(txn->fiber != NULL);
 	if (!txn_has_flag(txn, TXN_IS_DONE)) {
 		fiber_set_txn(fiber(), txn);
@@ -969,13 +978,22 @@ void
 txn_rollback(struct txn *txn)
 {
 	assert(txn == in_txn());
+	assert(txn->signature != TXN_SIGNATURE_UNKNOWN);
 	txn->status = TXN_ABORTED;
 	trigger_clear(&txn->fiber_on_stop);
 	if (!txn_has_flag(txn, TXN_CAN_YIELD))
 		trigger_clear(&txn->fiber_on_yield);
-	txn->signature = TXN_SIGNATURE_ROLLBACK;
 	txn_complete_fail(txn);
 	fiber_set_txn(fiber(), NULL);
+}
+
+void
+txn_abort(struct txn *txn)
+{
+	assert(!diag_is_empty(diag_get()));
+	assert(txn->signature == TXN_SIGNATURE_UNKNOWN);
+	txn->signature = TXN_SIGNATURE_ABORT;
+	txn_rollback(txn);
 }
 
 int
@@ -994,10 +1012,10 @@ txn_can_yield(struct txn *txn, bool set)
 	assert(txn == in_txn());
 	bool could = txn_has_flag(txn, TXN_CAN_YIELD);
 	if (set && !could) {
-		txn_set_flag(txn, TXN_CAN_YIELD);
+		txn_set_flags(txn, TXN_CAN_YIELD);
 		trigger_clear(&txn->fiber_on_yield);
 	} else if (!set && could) {
-		txn_clear_flag(txn, TXN_CAN_YIELD);
+		txn_clear_flags(txn, TXN_CAN_YIELD);
 		trigger_create(&txn->fiber_on_yield, txn_on_yield, NULL, NULL);
 		trigger_add(&fiber()->on_yield, &txn->fiber_on_yield);
 	}
@@ -1063,6 +1081,8 @@ box_txn_rollback(void)
 		diag_set(ClientError, ER_ROLLBACK_IN_SUB_STMT);
 		return -1;
 	}
+	assert(txn->signature == TXN_SIGNATURE_UNKNOWN);
+	txn->signature = TXN_SIGNATURE_ROLLBACK;
 	txn_rollback(txn); /* doesn't throw */
 	fiber_gc();
 	return 0;
@@ -1198,7 +1218,10 @@ txn_on_stop(struct trigger *trigger, void *event)
 {
 	(void) trigger;
 	(void) event;
-	txn_rollback(in_txn());                 /* doesn't yield or fail */
+	struct txn *txn = in_txn();
+	assert(txn->signature == TXN_SIGNATURE_UNKNOWN);
+	txn->signature = TXN_SIGNATURE_ROLLBACK;
+	txn_rollback(txn);
 	fiber_gc();
 	return 0;
 }
@@ -1229,6 +1252,6 @@ txn_on_yield(struct trigger *trigger, void *event)
 	assert(txn != NULL);
 	assert(!txn_has_flag(txn, TXN_CAN_YIELD));
 	txn_rollback_to_svp(txn, NULL);
-	txn_set_flag(txn, TXN_IS_ABORTED_BY_YIELD);
+	txn_set_flags(txn, TXN_IS_ABORTED_BY_YIELD);
 	return 0;
 }

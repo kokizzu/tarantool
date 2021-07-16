@@ -32,7 +32,7 @@
  */
 #include "small/rlist.h"
 #include "trivia/util.h"
-#include "third_party/tarantool_ev.h"
+#include <tarantool_ev.h>
 #include "xlog.h"
 #include "vclock/vclock.h"
 
@@ -74,7 +74,7 @@ recovery_delete(struct recovery *r);
  */
 void
 recovery_scan(struct recovery *r,  struct vclock *end_vclock,
-	      struct vclock *gc_vclock);
+	      struct vclock *gc_vclock, struct xstream *stream);
 
 void
 recovery_follow_local(struct recovery *r, struct xstream *stream,

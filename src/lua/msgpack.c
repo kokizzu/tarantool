@@ -31,6 +31,7 @@
 #include "lua/msgpack.h"
 #include "mpstream/mpstream.h"
 #include "lua/utils.h"
+#include "lua/serializer.h"
 
 #if defined(LUAJIT)
 #include <lj_ctype.h>
@@ -46,6 +47,7 @@
 #include "lib/uuid/mp_uuid.h" /* mp_decode_uuid() */
 #include "lib/core/mp_extension_types.h"
 
+#include "cord_buf.h"
 #include <fiber.h>
 
 void
@@ -362,8 +364,7 @@ lua_msgpack_encode(lua_State *L)
 					  "must be of type 'struct ibuf'");
 		}
 	} else {
-		buf = tarantool_lua_ibuf;
-		ibuf_reset(buf);
+		buf = cord_ibuf_take();
 	}
 	size_t used = ibuf_used(buf);
 
@@ -380,7 +381,7 @@ lua_msgpack_encode(lua_State *L)
 		lua_pushinteger(L, ibuf_used(buf) - used);
 	} else {
 		lua_pushlstring(L, buf->buf, ibuf_used(buf));
-		ibuf_reinit(buf);
+		cord_ibuf_drop(buf);
 	}
 	return 1;
 }

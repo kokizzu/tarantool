@@ -128,7 +128,8 @@ t
 ...
 space:insert({tostring(7)})
 ---
-- error: Duplicate key exists in unique index 'primary' in space 'test'
+- error: Duplicate key exists in unique index "primary" in space "test" with old tuple
+    - ["7"] and new tuple - ["7"]
 ...
 space:drop()
 ---
@@ -254,7 +255,8 @@ t
 ...
 space:insert({7})
 ---
-- error: Duplicate key exists in unique index 'primary' in space 'test'
+- error: Duplicate key exists in unique index "primary" in space "test" with old tuple
+    - [7] and new tuple - [7]
 ...
 space:drop()
 ---
@@ -380,7 +382,8 @@ t
 ...
 space:insert({7, 7})
 ---
-- error: Duplicate key exists in unique index 'primary' in space 'test'
+- error: Duplicate key exists in unique index "primary" in space "test" with old tuple
+    - [7, 7] and new tuple - [7, 7]
 ...
 space:drop()
 ---
@@ -506,7 +509,8 @@ t
 ...
 space:insert(box.tuple.new{tostring(7)})
 ---
-- error: Duplicate key exists in unique index 'primary' in space 'test'
+- error: Duplicate key exists in unique index "primary" in space "test" with old tuple
+    - ["7"] and new tuple - ["7"]
 ...
 space:drop()
 ---
@@ -604,7 +608,8 @@ space:select{}
 ...
 space:insert({1, 2, 3})
 ---
-- error: Duplicate key exists in unique index 'primary' in space 'test'
+- error: Duplicate key exists in unique index "primary" in space "test" with old tuple
+    - [1, 1, 1] and new tuple - [1, 2, 3]
 ...
 index1:select{}
 ---
@@ -762,15 +767,18 @@ s:insert({3, -3.0009})
 --
 s:insert({4, 1})
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected double'
+- error: 'Tuple field 2 (d) type does not match one required by operation: expected
+    double, got unsigned'
 ...
 s:insert({5, -9223372036854775800ULL})
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected double'
+- error: 'Tuple field 2 (d) type does not match one required by operation: expected
+    double, got unsigned'
 ...
 s:insert({6, 18000000000000000000ULL})
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected double'
+- error: 'Tuple field 2 (d) type does not match one required by operation: expected
+    double, got unsigned'
 ...
 --
 -- To insert an integer, we must cast it to a CDATA of type DOUBLE
@@ -892,19 +900,23 @@ ddd = s:create_index('ddd', {parts = {{2, 'double'}}})
 ...
 s:update(1, {{'=', 2, 2}})
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected double'
+- error: 'Tuple field 2 (d) type does not match one required by operation: expected
+    double, got unsigned'
 ...
 s:insert({22, 22})
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected double'
+- error: 'Tuple field 2 (d) type does not match one required by operation: expected
+    double, got unsigned'
 ...
 s:upsert({10, 100}, {{'=', 2, 2}})
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected double'
+- error: 'Tuple field 2 (d) type does not match one required by operation: expected
+    double, got unsigned'
 ...
 s:upsert({100, 100}, {{'=', 2, 2}})
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected double'
+- error: 'Tuple field 2 (d) type does not match one required by operation: expected
+    double, got unsigned'
 ...
 ddd:update(1, {{'=', 1, 70}})
 ---

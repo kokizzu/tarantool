@@ -18,9 +18,9 @@
 # otherwise this dependency is left unmet. If there are any issues
 # with building an RPM package on RHEL/CentOS 7 read the docs:
 # https://www.tarantool.io/en/doc/latest/dev_guide/building_from_source/
-BuildRequires: cmake3 >= 3.1
+BuildRequires: cmake3 >= 3.2
 %else
-BuildRequires: cmake >= 3.1
+BuildRequires: cmake >= 3.2
 %endif
 
 BuildRequires: make
@@ -89,25 +89,17 @@ BuildRequires: libunwind-devel
 %endif
 
 # Set dependences for tests.
-# Since Python 2 was deprecated then new OS do not have repositories
-# with its packages. It is not good way to create all these packages
-# manually and store it as backported. Let's wait when Python 3 will
-# be used for testing.
-%if (0%{?fedora} < 33 && 0%{?rhel} < 9)
-# Do not install unused Python 3 packages which
-# is default since Fedora 31 and CentOS 8.
-%if (0%{?fedora} >= 31 || 0%{?rhel} >= 8)
-BuildRequires: python2 >= 2.7
-BuildRequires: python2-six >= 1.9.0
-BuildRequires: python2-gevent >= 1.0
-BuildRequires: python2-yaml >= 3.0.9
+BuildRequires: python3
+BuildRequires: python3-six
+BuildRequires: python3-gevent
+%if (0%{?sle_version} >= 1500)
+BuildRequires: python3-PyYAML
 %else
-BuildRequires: python >= 2.7
-BuildRequires: python-six >= 1.9.0
-BuildRequires: python-gevent >= 1.0
-BuildRequires: python-yaml >= 3.0.9
+BuildRequires: python3-pyyaml
 %endif
-%endif
+
+# Install prove to run LuaJIT tests.
+BuildRequires: perl-Test-Harness
 
 Name: tarantool
 # ${major}.${major}.${minor}.${patch}, e.g. 1.6.8.175
@@ -132,7 +124,7 @@ Requires: openssl
 # RHEL <= 7 doesn't support Recommends:
 Recommends: tarantool-devel
 Recommends: git-core
-Recommends: cmake >= 3.1
+Recommends: cmake >= 3.2
 Recommends: make
 Recommends: gcc >= 4.5
 Recommends: gcc-c++ >= 4.5
@@ -205,11 +197,7 @@ make %{?_smp_mflags}
 rm -rf %{buildroot}%{_datarootdir}/doc/tarantool/
 
 %check
-# Blocked testing starting from Fedora 33 while Python 3 not enabled
-# for testing, issue for switching it on is tarantool/tarantool-qa#17.
-%if 0%{?fedora} < 33
 make test-force
-%endif
 
 %pre
 /usr/sbin/groupadd -r tarantool > /dev/null 2>&1 || :
@@ -280,6 +268,7 @@ fi
 %{_includedir}/tarantool/luajit.h
 %{_includedir}/tarantool/lualib.h
 %{_includedir}/tarantool/module.h
+%{_includedir}/tarantool/curl
 
 %changelog
 * Tue Sep 12 2017 Roman Tsisyk <roman@tarantool.org> 1.7.5.46-1

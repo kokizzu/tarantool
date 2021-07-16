@@ -37,7 +37,7 @@
 #include "exception.h"
 #include "crc32.h"
 #include "fio.h"
-#include "third_party/tarantool_eio.h"
+#include <tarantool_eio.h>
 #include <msgpuck.h>
 
 #include "coio_file.h"
@@ -314,8 +314,8 @@ xlog_meta_parse(struct xlog_meta *meta, const char **data,
 			/*
 			 * Unknown key
 			 */
-			say_warn("Unknown meta item: `%.*s'", key_end - key,
-				 key);
+			say_warn("Unknown meta item: '%.*s'",
+				 (int)(key_end - key), key);
 		}
 	}
 	*data = end + 1; /* skip the last trailing \n of \n\n sequence */
@@ -588,7 +588,7 @@ xdir_scan(struct xdir *dir, bool is_dir_required)
 		signatures[s_count++] = signature;
 	}
 	/** Sort the list of files */
-	if (s_count > 0)
+	if (s_count > 1)
 		qsort(signatures, s_count, sizeof(*signatures), cmp_i64);
 	/**
 	 * Update the log dir index with the current state:
@@ -684,16 +684,35 @@ xdir_collect_garbage(struct xdir *dir, int64_t signature, unsigned flags)
 	       vclock_sum(vclock) < signature) {
 		const char *filename =
 			xdir_format_filename(dir, vclock_sum(vclock), NONE);
-		if (flags & XDIR_GC_ASYNC)
+		if (flags & XDIR_GC_ASYNC) {
 			eio_unlink(filename, 0, xdir_complete_gc, NULL);
-		else
-			xdir_say_gc(unlink(filename), errno, filename);
+		} else {
+			int rc = unlink(filename);
+			xdir_say_gc(rc, errno, filename);
+		}
 		vclockset_remove(&dir->index, vclock);
 		free(vclock);
 
 		if (flags & XDIR_GC_REMOVE_ONE)
 			break;
 	}
+}
+
+int
+xdir_remove_file_by_vclock(struct xdir *dir, struct vclock *to_remove)
+{
+	struct vclock *find = vclockset_match(&dir->index, to_remove);
+	if (vclock_compare(find, to_remove) != 0)
+		return -1;
+	const char *filename =
+		xdir_format_filename(dir, vclock_sum(find), NONE);
+	int rc = unlink(filename);
+	xdir_say_gc(rc, errno, filename);
+	if (rc != 0)
+		return -1;
+	vclockset_remove(&dir->index, find);
+	free(find);
+	return 0;
 }
 
 void

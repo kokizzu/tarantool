@@ -112,9 +112,12 @@ sq1 == sq2, msg
 _ = box.schema.sequence.create('test2')
 ---
 ...
-box.schema.sequence.alter('test2', {name = 'test'})
+err, res = pcall(function() return box.schema.sequence.alter('test2', {name = 'test'}) end)
 ---
-- error: Duplicate key exists in unique index 'name' in space '_sequence'
+...
+assert(res.code == box.error.TUPLE_FOUND)
+---
+- true
 ...
 box.schema.sequence.drop('test2')
 ---
@@ -1115,7 +1118,8 @@ s.index.pk.sequence_id == nil
 ...
 s:insert{nil, 'x'} -- error
 ---
-- error: 'Tuple field 1 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 1 type does not match one required by operation: expected unsigned,
+    got nil'
 ...
 box.sequence.test_seq == nil
 ---
@@ -2269,7 +2273,8 @@ s.index.pk.sequence_id == nil
 ...
 s:insert{box.NULL} -- error
 ---
-- error: 'Tuple field 1 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 1 type does not match one required by operation: expected unsigned,
+    got nil'
 ...
 s.index.pk:alter{sequence = sq}
 ---

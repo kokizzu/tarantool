@@ -37,26 +37,13 @@
 #include "small/rlist.h"
 #include "func_def.h"
 #include "user_def.h"
+#include "module_cache.h"
 
 #if defined(__cplusplus)
 extern "C" {
 #endif /* defined(__cplusplus) */
 
 struct func;
-
-/**
- * Dynamic shared module.
- */
-struct module {
-	/** Module dlhandle. */
-	void *handle;
-	/** List of imported functions. */
-	struct rlist funcs;
-	/** Count of active calls. */
-	size_t calls;
-	/** Module's package name. */
-	char package[0];
-};
 
 /** Virtual method table for func object. */
 struct func_vtab {
@@ -85,16 +72,16 @@ struct func {
 };
 
 /**
- * Initialize modules subsystem.
+ * Initialize schema modules subsystem.
  */
 int
-module_init(void);
+schema_module_init(void);
 
 /**
- * Cleanup modules subsystem.
+ * Cleanup schema modules subsystem.
  */
 void
-module_free(void);
+schema_module_free(void);
 
 struct func *
 func_new(struct func_def *def);
@@ -109,16 +96,15 @@ int
 func_call(struct func *func, struct port *args, struct port *ret);
 
 /**
- * Reload dynamically loadable module.
+ * Reload dynamically loadable schema module.
  *
  * @param package name begin pointer.
  * @param package_end package_end name end pointer.
- * @param[out] module a pointer to store module object on success.
  * @retval -1 on error.
  * @retval 0 on success.
  */
 int
-module_reload(const char *package, const char *package_end, struct module **module);
+schema_module_reload(const char *package, const char *package_end);
 
 #if defined(__cplusplus)
 } /* extern "C" */

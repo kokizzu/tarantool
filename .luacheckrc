@@ -30,12 +30,11 @@ include_files = {
 
 exclude_files = {
     "build/**/*.lua",
-    "test-run/**/*.lua",
+    "test-run/test/test-tarantool/*.test.lua",
     "test/app/*.test.lua",
     "test/box/*.test.lua",
     "test/engine/*.test.lua",
     "test/engine_long/*.test.lua",
-    "test/luajit-tap/**/*.lua",
     "test/replication/*.test.lua",
     "test/sql/**/*.lua",
     "test/swim/*.test.lua",
@@ -50,35 +49,8 @@ exclude_files = {
 
 files["test/sql-tap/**/*.lua"] = {
     ignore = {
-        -- Accessing an undefined global variable.
-        "113",
-        -- Unused local variable.
-        "211",
-        -- Unused argument.
-        "212",
-        -- Unused loop variable.
-        "213",
-        -- Local variable is set but never accessed.
-        "231",
-        -- "Value assigned to a local variable is unused."
-        "311",
-        -- Unreachable code.
-        "511",
-        -- Loop can be executed at most once.
-        "512",
-        -- An empty if branch.
-        "542",
-        -- A line consists of nothing but whitespace.
-        "611",
-        -- A line contains trailing whitespace.
-        "612",
-        -- Trailing whitespace in a string.
-        "613",
-        -- Trailing whitespace in a comment.
-        "614",
-        -- Inconsistent indentation (SPACE followed by TAB).
-        "621",
         -- Line is too long.
+        -- https://github.com/tarantool/tarantool/issues/5181
         "631"
     }
 }
@@ -103,6 +75,12 @@ files["test/box/box.lua"] = {
         "sorted",
         "iproto_request",
     }
+}
+files["test/box/gh-5645-several-iproto-threads.lua"] = {
+    globals = {
+        "errinj_set",
+        "ping",
+    },
 }
 files["test/box-tap/session.test.lua"] = {
     globals = {

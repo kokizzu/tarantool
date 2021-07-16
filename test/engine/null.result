@@ -88,7 +88,8 @@ s:insert{3, box.NULL}
 ...
 s:insert{4, 1} -- Fail.
 ---
-- error: Duplicate key exists in unique index 'sk' in space 'test'
+- error: Duplicate key exists in unique index "sk" in space "test" with old tuple
+    - [1, 1] and new tuple - [4, 1]
 ...
 s:insert{4, 4}
 ---
@@ -371,7 +372,8 @@ sk2:select{}
 -- Check duplicate conflict on replace.
 s:replace{4, 4, 3} -- fail
 ---
-- error: Duplicate key exists in unique index 'sk2' in space 'test'
+- error: Duplicate key exists in unique index "sk2" in space "test" with old tuple
+    - [3, 3, 3] and new tuple - [4, 4, 3]
 ...
 s:replace{4, 4, box.NULL} -- ok
 ---
@@ -458,7 +460,7 @@ sk = s:create_index('sk', {parts = {2, 'unsigned'}})
 ...
 s:replace{1, 2} -- error
 ---
-- error: Tuple field 3 required by space format is missing
+- error: Tuple field 3 (field3) required by space format is missing
 ...
 t1 = s:replace{2, 3, 4}
 ---
@@ -529,15 +531,15 @@ sk = s:create_index('sk', {parts = {2, 'unsigned'}})
 ...
 s:replace{1, 2} -- error
 ---
-- error: Tuple field 3 required by space format is missing
+- error: Tuple field 3 (field3) required by space format is missing
 ...
 s:replace{2, 3, 4} -- error
 ---
-- error: Tuple field 5 required by space format is missing
+- error: Tuple field 5 (field5) required by space format is missing
 ...
 s:replace{3, 4, 5, 6} -- error
 ---
-- error: Tuple field 5 required by space format is missing
+- error: Tuple field 5 (field5) required by space format is missing
 ...
 t1 = s:replace{4, 5, 6, 7, 8}
 ---
@@ -966,7 +968,8 @@ s:replace{50, 50}
 ...
 s:replace{25, box.NULL}
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 2 (field2) type does not match one required by operation: expected
+    unsigned, got nil'
 ...
 format[2].is_nullable = true
 ---
@@ -1021,7 +1024,8 @@ s:replace{50, 50}
 ...
 s:replace{25, box.NULL}
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 2 type does not match one required by operation: expected unsigned,
+    got nil'
 ...
 sk:alter({parts = {{2, 'unsigned', is_nullable = true}}})
 ---
@@ -1612,7 +1616,8 @@ s:replace{1, 1}
 ...
 s:replace{2, box.NULL}
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 2 type does not match one required by operation: expected unsigned,
+    got nil'
 ...
 s:select{}
 ---
@@ -1764,11 +1769,12 @@ s:format(format)
 -- Field 2 is not nullable.
 s:insert{5}
 ---
-- error: Tuple field 2 required by space format is missing
+- error: Tuple field 2 (second) required by space format is missing
 ...
 s:insert{5, box.NULL}
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 2 (second) type does not match one required by operation: expected
+    unsigned, got nil'
 ...
 s.index.secondary:alter{parts={{2, 'unsigned', is_nullable=true}}} -- This is allowed.
 ---
@@ -1776,11 +1782,12 @@ s.index.secondary:alter{parts={{2, 'unsigned', is_nullable=true}}} -- This is al
 -- Without space format setting this fails.
 s:insert{5, box.NULL}
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 2 (second) type does not match one required by operation: expected
+    unsigned, got nil'
 ...
 s:insert{5}
 ---
-- error: Tuple field 2 required by space format is missing
+- error: Tuple field 2 (second) required by space format is missing
 ...
 s.index.secondary:alter{parts={{2, 'unsigned', is_nullable=false}}}
 ---
@@ -1794,11 +1801,12 @@ s:format(format) -- This is also allowed.
 -- inserts still fail due to not nullable index parts.
 s:insert{5, box.NULL}
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 2 (second) type does not match one required by operation: expected
+    unsigned, got nil'
 ...
 s:insert{5}
 ---
-- error: Tuple field 2 required by space format is missing
+- error: Tuple field 2 (second) required by space format is missing
 ...
 s.index.secondary:alter{parts={{2, 'unsigned', is_nullable=true}}}
 ---
@@ -1830,22 +1838,24 @@ format[2].is_nullable = false
 ...
 s:format(format) -- Fail.
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 2 (second) type does not match one required by operation: expected
+    unsigned, got nil'
 ...
 s.index.secondary:alter{parts={{2, 'unsigned', is_nullable=false}}} -- Fail.
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 2 (second) type does not match one required by operation: expected
+    unsigned, got nil'
 ...
 _ = s:delete{5}
 ---
 ...
 s:format(format) -- Still fail.
 ---
-- error: Tuple field 2 required by space format is missing
+- error: Tuple field 2 (second) required by space format is missing
 ...
 s.index.secondary:alter{parts={{2, 'unsigned', is_nullable=false}}} -- Still fail.
 ---
-- error: Tuple field 2 required by space format is missing
+- error: Tuple field 2 (second) required by space format is missing
 ...
 -- Now check we can set nullability to false step by step.
 _ = s:delete{6}
@@ -1859,11 +1869,12 @@ s:format(format)
 ...
 s:insert{5, box.NULL} -- Fail.
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 2 (second) type does not match one required by operation: expected
+    unsigned, got nil'
 ...
 s:insert{5} -- Fail.
 ---
-- error: Tuple field 2 required by space format is missing
+- error: Tuple field 2 (second) required by space format is missing
 ...
 format[2].is_nullable = true
 ---
@@ -1876,11 +1887,12 @@ s.index.secondary:alter{parts={{2, 'unsigned', is_nullable=false}}}
 ...
 s:insert{5, box.NULL} -- Fail.
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected unsigned'
+- error: 'Tuple field 2 (second) type does not match one required by operation: expected
+    unsigned, got nil'
 ...
 s:insert{5} -- Fail.
 ---
-- error: Tuple field 2 required by space format is missing
+- error: Tuple field 2 (second) required by space format is missing
 ...
 format[2].is_nullable = false
 ---
@@ -1894,7 +1906,7 @@ s:select{}
 ...
 s:insert{5} -- Fail.
 ---
-- error: Tuple field 2 required by space format is missing
+- error: Tuple field 2 (second) required by space format is missing
 ...
 s:insert{9, 10} -- Success.
 ---
@@ -1922,7 +1934,8 @@ sk2 = s:create_index('sk2', {parts={{2, 'number', is_nullable=true}}})
 ...
 s:insert{2, nil, 2} --error
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected number'
+- error: 'Tuple field 2 type does not match one required by operation: expected number,
+    got nil'
 ...
 s:drop()
 ---
@@ -1981,7 +1994,8 @@ sk2:select{}
 -- Error
 sk3 = s:create_index('sk3', {parts={{2, 'number', is_nullable=false}}})
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected number'
+- error: 'Tuple field 2 type does not match one required by operation: expected number,
+    got nil'
 ...
 s:truncate()
 ---
@@ -1996,7 +2010,8 @@ s:insert{1, 1}
 ...
 s:insert{2, box.NULL} -- error
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected number'
+- error: 'Tuple field 2 type does not match one required by operation: expected number,
+    got nil'
 ...
 s:drop()
 ---
@@ -2430,6 +2445,132 @@ ch:get()
 sk:select{}
 ---
 - - [42, 42]
+...
+s:drop()
+---
+...
+-- gh-5674: ignoring index part options when type is omitted
+s = box.schema.space.create('test', {engine=engine})
+---
+...
+_ = s:create_index('pk', {parts = {1, 'int'}})
+---
+...
+sk = s:create_index('sk', {parts = {2, is_nullable=true}})
+---
+...
+sk.parts
+---
+- - type: scalar
+    is_nullable: true
+    fieldno: 2
+...
+sk:drop()
+---
+...
+sk = s:create_index('sk', {parts = {2, is_nullable=true, collation='unicode'}})
+---
+...
+sk.parts
+---
+- - type: scalar
+    is_nullable: true
+    collation: unicode
+    fieldno: 2
+...
+sk:drop()
+---
+...
+sk = s:create_index('sk', {parts = {2, type='string', is_nullable=true, collation='unicode'}})
+---
+...
+sk.parts
+---
+- - type: string
+    is_nullable: true
+    collation: unicode
+    fieldno: 2
+...
+sk:drop()
+---
+...
+sk = s:create_index('sk', {parts = {2, is_nullable=true, 3}})
+---
+- error: 'Illegal parameters, options.parts: unexpected option(s)'
+...
+sk.parts
+---
+- - type: string
+    is_nullable: true
+    collation: unicode
+    fieldno: 2
+...
+sk:drop()
+---
+...
+sk = s:create_index('sk', {parts = {2, 3}})
+---
+...
+sk.parts
+---
+- - type: scalar
+    is_nullable: false
+    fieldno: 2
+  - type: scalar
+    is_nullable: false
+    fieldno: 3
+...
+sk:drop()
+---
+...
+sk = s:create_index('sk', {parts = {2, 3, 4}})
+---
+...
+sk.parts
+---
+- - type: scalar
+    is_nullable: false
+    fieldno: 2
+  - type: scalar
+    is_nullable: false
+    fieldno: 3
+  - type: scalar
+    is_nullable: false
+    fieldno: 4
+...
+sk:drop()
+---
+...
+sk = s:create_index('sk', {parts = {{2, 'int'}, {3, 'string'}}})
+---
+...
+sk.parts
+---
+- - type: integer
+    is_nullable: false
+    fieldno: 2
+  - type: string
+    is_nullable: false
+    fieldno: 3
+...
+sk:drop()
+---
+...
+sk = s:create_index('sk', {parts = {{2, is_nullable=true}, {3, collation='unicode'}}})
+---
+...
+sk.parts
+---
+- - type: scalar
+    is_nullable: true
+    fieldno: 2
+  - type: scalar
+    is_nullable: false
+    collation: unicode
+    fieldno: 3
+...
+sk:drop()
+---
 ...
 s:drop()
 ---

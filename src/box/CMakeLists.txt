@@ -42,6 +42,7 @@ set(sql_sources
     sql/legacy.c
     sql/main.c
     sql/malloc.c
+    sql/mem.c
     sql/os.c
     sql/os_unix.c
     sql/parse_def.c
@@ -126,6 +127,7 @@ add_library(box STATIC
     memtx_rtree.c
     memtx_bitset.c
     memtx_tx.c
+    module_cache.c
     engine.c
     memtx_engine.c
     memtx_space.c
@@ -195,6 +197,7 @@ add_library(box STATIC
     lua/call.c
     lua/cfg.cc
     lua/console.c
+    lua/lib.c
     lua/serialize_lua.c
     lua/tuple.c
     lua/slab.c

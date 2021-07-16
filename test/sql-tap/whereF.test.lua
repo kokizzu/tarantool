@@ -13,7 +13,7 @@ test:plan(13)
 --    May you share freely, never taking more than you give.
 --
 -------------------------------------------------------------------------
--- 
+--
 -- Test cases for query planning decisions.
 --
 -- The tests in this file demonstrate the behaviour of the query planner
@@ -48,7 +48,6 @@ test:plan(13)
 --
 -- ["set","testdir",[["file","dirname",["argv0"]]]]
 -- ["source",[["testdir"],"\/tester.tcl"]]
-local testprefix = "whereF"
 test:do_execsql_test(
     1.0,
     [[
@@ -56,7 +55,7 @@ test:do_execsql_test(
         CREATE TABLE t2(d INT PRIMARY KEY, e INT, f INT);
     ]], {
         -- <1.0>
-        
+
         -- </1.0>
     })
 
@@ -84,7 +83,7 @@ test:do_execsql_test(
         CREATE UNIQUE INDEX i2 ON t1(b);
     ]], {
         -- <2.0>
-        
+
         -- </2.0>
     })
 
@@ -121,7 +120,7 @@ test:do_execsql_test(
         CREATE TABLE t2(d INT PRIMARY KEY, e INT, f INT);
     ]], {
         -- <3.0>
-        
+
         -- </3.0>
     })
 

@@ -41,9 +41,12 @@ static inline void
 txn_limbo_create(struct txn_limbo *limbo)
 {
 	rlist_create(&limbo->queue);
+	limbo->len = 0;
 	limbo->owner_id = REPLICA_ID_NIL;
 	fiber_cond_create(&limbo->wait_cond);
 	vclock_create(&limbo->vclock);
+	vclock_create(&limbo->promote_term_map);
+	limbo->promote_greatest_term = 0;
 	limbo->confirmed_lsn = 0;
 	limbo->rollback_count = 0;
 	limbo->is_in_rollback = false;
@@ -76,7 +79,8 @@ txn_limbo_append(struct txn_limbo *limbo, uint32_t id, struct txn *txn)
 	 * needs that to be able rollback transactions, whose WAL write is in
 	 * progress.
 	 */
-	assert(txn->signature < 0);
+	assert(txn->signature == TXN_SIGNATURE_UNKNOWN);
+	assert(txn->status == TXN_PREPARED);
 	if (limbo->is_in_rollback) {
 		/*
 		 * Cascading rollback. It is impossible to commit the
@@ -93,8 +97,7 @@ txn_limbo_append(struct txn_limbo *limbo, uint32_t id, struct txn *txn)
 		id = instance_id;
 	bool make_ro = false;
 	if (limbo->owner_id != id) {
-		if (limbo->owner_id == REPLICA_ID_NIL ||
-		    rlist_empty(&limbo->queue)) {
+		if (rlist_empty(&limbo->queue)) {
 			limbo->owner_id = id;
 			limbo->confirmed_lsn = 0;
 			if (id != instance_id)
@@ -118,6 +121,7 @@ txn_limbo_append(struct txn_limbo *limbo, uint32_t id, struct txn *txn)
 	e->is_commit = false;
 	e->is_rollback = false;
 	rlist_add_tail_entry(&limbo->queue, e, in_queue);
+	limbo->len++;
 	/*
 	 * We added new entries from a remote instance to an empty limbo.
 	 * Time to make this instance read-only.
@@ -132,8 +136,8 @@ txn_limbo_remove(struct txn_limbo *limbo, struct txn_limbo_entry *entry)
 {
 	assert(!rlist_empty(&entry->in_queue));
 	assert(txn_limbo_first_entry(limbo) == entry);
-	(void) limbo;
 	rlist_del_entry(entry, in_queue);
+	limbo->len--;
 }
 
 static inline void
@@ -144,6 +148,7 @@ txn_limbo_pop(struct txn_limbo *limbo, struct txn_limbo_entry *entry)
 	assert(entry->is_rollback);
 
 	rlist_del_entry(entry, in_queue);
+	limbo->len--;
 	++limbo->rollback_count;
 }
 
@@ -266,8 +271,7 @@ txn_limbo_wait_complete(struct txn_limbo *limbo, struct txn_limbo_entry *entry)
 					 in_queue, tmp) {
 		e->txn->signature = TXN_SIGNATURE_QUORUM_TIMEOUT;
 		txn_limbo_abort(limbo, e);
-		txn_clear_flag(e->txn, TXN_WAIT_SYNC);
-		txn_clear_flag(e->txn, TXN_WAIT_ACK);
+		txn_clear_flags(e->txn, TXN_WAIT_SYNC | TXN_WAIT_ACK);
 		txn_complete_fail(e->txn);
 		if (e == entry)
 			break;
@@ -302,34 +306,24 @@ complete:
 	return 0;
 }
 
-/**
- * A callback for synchronous write: txn_limbo_write_synchro fiber
- * waiting to proceed once a record is written to WAL.
- */
 static void
-txn_limbo_write_cb(struct journal_entry *entry)
+txn_limbo_write_synchro(struct txn_limbo *limbo, uint16_t type, int64_t lsn,
+			uint64_t term)
 {
-	assert(entry->complete_data != NULL);
-	if (fiber() != entry->complete_data)
-		fiber_wakeup(entry->complete_data);
-}
-
-static void
-txn_limbo_write_synchro(struct txn_limbo *limbo, uint32_t type, int64_t lsn)
-{
-	assert(lsn > 0);
+	assert(lsn >= 0);
 
 	struct synchro_request req = {
 		.type		= type,
 		.replica_id	= limbo->owner_id,
 		.lsn		= lsn,
+		.term		= term,
 	};
 
 	/*
 	 * This is a synchronous commit so we can
 	 * allocate everything on a stack.
 	 */
-	struct synchro_body_bin body;
+	char body[XROW_SYNCHRO_BODY_LEN_MAX];
 	struct xrow_header row;
 	char buf[sizeof(struct journal_entry) +
 		 sizeof(struct xrow_header *)];
@@ -337,26 +331,30 @@ txn_limbo_write_synchro(struct txn_limbo *limbo, uint32_t type, int64_t lsn)
 	struct journal_entry *entry = (struct journal_entry *)buf;
 	entry->rows[0] = &row;
 
-	xrow_encode_synchro(&row, &body, &req);
+	xrow_encode_synchro(&row, body, &req);
 
 	journal_entry_create(entry, 1, xrow_approx_len(&row),
-			     txn_limbo_write_cb, fiber());
+			     journal_entry_fiber_wakeup_cb, fiber());
 
-	if (journal_write(entry) != 0 || entry->res < 0) {
-		diag_set(ClientError, ER_WAL_IO);
-		diag_log();
-		/*
-		 * XXX: the stub is supposed to be removed once it is defined
-		 * what to do when a synchro request WAL write fails. One of
-		 * the possible solutions: log the error, keep the limbo
-		 * queue as is and probably put in rollback mode. Then
-		 * provide a hook to call manually when WAL problems are fixed.
-		 * Or retry automatically with some period.
-		 */
-		panic("Could not write a synchro request to WAL: "
-		      "lsn = %lld, type = %s\n", lsn,
-		      iproto_type_name(type));
+	if (journal_write(entry) != 0)
+		goto fail;
+	if (entry->res < 0) {
+		diag_set_journal_res(entry->res);
+		goto fail;
 	}
+	return;
+fail:
+	diag_log();
+	/*
+	 * XXX: the stub is supposed to be removed once it is defined what to do
+	 * when a synchro request WAL write fails. One of the possible
+	 * solutions: log the error, keep the limbo queue as is and probably put
+	 * in rollback mode. Then provide a hook to call manually when WAL
+	 * problems are fixed. Or retry automatically with some period.
+	 */
+	panic("Could not write a synchro request to WAL: lsn = %lld, "
+	      "type = %s\n", (long long)lsn, iproto_type_name(type));
+
 }
 
 /**
@@ -369,14 +367,14 @@ txn_limbo_write_confirm(struct txn_limbo *limbo, int64_t lsn)
 	assert(lsn > limbo->confirmed_lsn);
 	assert(!limbo->is_in_rollback);
 	limbo->confirmed_lsn = lsn;
-	txn_limbo_write_synchro(limbo, IPROTO_CONFIRM, lsn);
+	txn_limbo_write_synchro(limbo, IPROTO_CONFIRM, lsn, 0);
 }
 
 /** Confirm all the entries <= @a lsn. */
 static void
 txn_limbo_read_confirm(struct txn_limbo *limbo, int64_t lsn)
 {
-	assert(limbo->owner_id != REPLICA_ID_NIL);
+	assert(limbo->owner_id != REPLICA_ID_NIL || txn_limbo_is_empty(limbo));
 	assert(limbo == &txn_limbo);
 	struct txn_limbo_entry *e, *tmp;
 	rlist_foreach_entry_safe(e, &limbo->queue, in_queue, tmp) {
@@ -396,26 +394,43 @@ txn_limbo_read_confirm(struct txn_limbo *limbo, int64_t lsn)
 			 */
 			if (e->lsn == -1)
 				break;
+		} else if (e->txn->signature == TXN_SIGNATURE_UNKNOWN) {
+			/*
+			 * A transaction might be covered by the CONFIRM even if
+			 * it is not written to WAL yet when it is an async
+			 * transaction. It could be created just when the
+			 * CONFIRM was being written to WAL.
+			 */
+			assert(e->txn->status == TXN_PREPARED);
+			/*
+			 * Let it complete normally as a plain transaction. It
+			 * is important to remove the limbo entry, because the
+			 * async transaction might be committed in a
+			 * non-blocking way and won't ever wait explicitly for
+			 * its completion. Therefore, won't be able to remove
+			 * the limbo entry on its own. This happens for txns
+			 * created in the applier.
+			 */
+			txn_clear_flags(e->txn, TXN_WAIT_SYNC);
+			txn_limbo_remove(limbo, e);
+			/*
+			 * The limbo entry now should not be used by the owner
+			 * transaction since it just became a plain one. Nullify
+			 * the txn to get a crash on any usage attempt instead
+			 * of potential undefined behaviour.
+			 */
+			e->txn = NULL;
+			continue;
 		}
 		e->is_commit = true;
 		txn_limbo_remove(limbo, e);
-		txn_clear_flag(e->txn, TXN_WAIT_SYNC);
-		txn_clear_flag(e->txn, TXN_WAIT_ACK);
+		txn_clear_flags(e->txn, TXN_WAIT_SYNC | TXN_WAIT_ACK);
 		/*
-		 * If already written to WAL by now, finish tx processing.
-		 * Otherwise just clear the sync flags. Tx procesing will finish
-		 * automatically once the tx is written to WAL.
-		 *
-		 * XXX: Normally at this point all transactions covered by this
-		 * CONFIRM should be in WAL already, but there is a bug, that
-		 * replica always processes received synchro requests *before*
-		 * writing them to WAL. So it can happen, that a CONFIRM is
-		 * 'read', but the transaction is not written yet. Should be
-		 * fixed when the replica will behave properly, and then this
-		 * branch won't exist.
+		 * Should be written to WAL by now. Confirm is always written
+		 * after the affected transactions.
 		 */
-		if (e->txn->signature >= 0)
-			txn_complete_success(e->txn);
+		assert(e->txn->signature >= 0);
+		txn_complete_success(e->txn);
 	}
 	/* Update is_ro once the limbo is clear. */
 	if (txn_limbo_is_empty(limbo))
@@ -433,7 +448,7 @@ txn_limbo_write_rollback(struct txn_limbo *limbo, int64_t lsn)
 	assert(lsn > limbo->confirmed_lsn);
 	assert(!limbo->is_in_rollback);
 	limbo->is_in_rollback = true;
-	txn_limbo_write_synchro(limbo, IPROTO_ROLLBACK, lsn);
+	txn_limbo_write_synchro(limbo, IPROTO_ROLLBACK, lsn, 0);
 	limbo->is_in_rollback = false;
 }
 
@@ -441,7 +456,7 @@ txn_limbo_write_rollback(struct txn_limbo *limbo, int64_t lsn)
 static void
 txn_limbo_read_rollback(struct txn_limbo *limbo, int64_t lsn)
 {
-	assert(limbo->owner_id != REPLICA_ID_NIL);
+	assert(limbo->owner_id != REPLICA_ID_NIL || txn_limbo_is_empty(limbo));
 	assert(limbo == &txn_limbo);
 	struct txn_limbo_entry *e, *tmp;
 	struct txn_limbo_entry *last_rollback = NULL;
@@ -456,38 +471,51 @@ txn_limbo_read_rollback(struct txn_limbo *limbo, int64_t lsn)
 		return;
 	rlist_foreach_entry_safe_reverse(e, &limbo->queue, in_queue, tmp) {
 		txn_limbo_abort(limbo, e);
-		txn_clear_flag(e->txn, TXN_WAIT_SYNC);
-		txn_clear_flag(e->txn, TXN_WAIT_ACK);
-		if (e->txn->signature >= 0) {
-			/* Rollback the transaction. */
-			e->txn->signature = TXN_SIGNATURE_SYNC_ROLLBACK;
-			txn_complete_fail(e->txn);
-		} else {
-			/*
-			 * Rollback the transaction, but don't free it yet. It
-			 * will be freed after its WAL write is completed.
-			 *
-			 * XXX: Normally at this point all transactions covered
-			 * by this ROLLBACK should be in WAL already, but there
-			 * is a bug, that replica always processes received
-			 * synchro requests *before* writing them to WAL. So it
-			 * can happen, that a ROLLBACK is 'read', but the
-			 * transaction is not written yet. Should be fixed when
-			 * the replica will behave properly, and then this
-			 * branch won't exist.
-			 */
-			e->txn->signature = TXN_SIGNATURE_SYNC_ROLLBACK;
-			struct fiber *fiber = e->txn->fiber;
-			e->txn->fiber = fiber();
-			txn_complete_fail(e->txn);
-			e->txn->fiber = fiber;
-		}
+		txn_clear_flags(e->txn, TXN_WAIT_SYNC | TXN_WAIT_ACK);
+		/*
+		 * Should be written to WAL by now. Rollback is always written
+		 * after the affected transactions.
+		 */
+		assert(e->txn->signature >= 0);
+		e->txn->signature = TXN_SIGNATURE_SYNC_ROLLBACK;
+		txn_complete_fail(e->txn);
 		if (e == last_rollback)
 			break;
 	}
 	/* Update is_ro once the limbo is clear. */
 	if (txn_limbo_is_empty(limbo))
 		box_update_ro_summary();
+}
+
+void
+txn_limbo_write_promote(struct txn_limbo *limbo, int64_t lsn, uint64_t term)
+{
+	limbo->confirmed_lsn = lsn;
+	limbo->is_in_rollback = true;
+	/*
+	 * We make sure that promote is only written once everything this
+	 * instance has may be confirmed.
+	 */
+	struct txn_limbo_entry *e = txn_limbo_last_synchro_entry(limbo);
+	assert(e == NULL || e->lsn <= lsn);
+	(void) e;
+	txn_limbo_write_synchro(limbo, IPROTO_PROMOTE, lsn, term);
+	limbo->is_in_rollback = false;
+}
+
+/**
+ * Process a PROMOTE request, i.e. confirm all entries <= @a req.lsn and
+ * rollback all entries > @a req.lsn.
+ */
+static void
+txn_limbo_read_promote(struct txn_limbo *limbo, uint32_t replica_id,
+		       int64_t lsn)
+{
+	txn_limbo_read_confirm(limbo, lsn);
+	txn_limbo_read_rollback(limbo, lsn + 1);
+	assert(txn_limbo_is_empty(&txn_limbo));
+	limbo->owner_id = replica_id;
+	limbo->confirmed_lsn = 0;
 }
 
 void
@@ -532,8 +560,7 @@ txn_limbo_ack(struct txn_limbo *limbo, uint32_t replica_id, int64_t lsn)
 		 */
 		if (!txn_has_flag(e->txn, TXN_WAIT_ACK)) {
 			assert(e->lsn == -1);
-			if (confirm_lsn == -1)
-				continue;
+			continue;
 		} else if (e->lsn <= prev_lsn) {
 			continue;
 		} else if (++e->ack_count < replication_synchro_quorum) {
@@ -585,11 +612,14 @@ txn_rollback_cb(struct trigger *trigger, void *event)
 	return 0;
 }
 
-int
-txn_limbo_wait_confirm(struct txn_limbo *limbo)
+/**
+ * Wait until the last transaction in the limbo is finished and get its result.
+ */
+static int
+txn_limbo_wait_last_txn(struct txn_limbo *limbo, bool *is_rollback,
+			double timeout)
 {
-	if (txn_limbo_is_empty(limbo))
-		return 0;
+	assert(!txn_limbo_is_empty(limbo));
 
 	/* initialization of a waitpoint. */
 	struct confirm_waitpoint cwp;
@@ -605,27 +635,42 @@ txn_limbo_wait_confirm(struct txn_limbo *limbo)
 	struct txn_limbo_entry *tle = txn_limbo_last_entry(limbo);
 	txn_on_commit(tle->txn, &on_complete);
 	txn_on_rollback(tle->txn, &on_rollback);
-	double start_time = fiber_clock();
+	double deadline = fiber_clock() + timeout;
+	int rc;
 	while (true) {
-		double deadline = start_time + replication_synchro_timeout;
+		if (timeout < 0) {
+			rc = -1;
+			break;
+		}
 		bool cancellable = fiber_set_cancellable(false);
-		double timeout = deadline - fiber_clock();
-		int rc = fiber_cond_wait_timeout(&limbo->wait_cond, timeout);
+		rc = fiber_cond_wait_timeout(&limbo->wait_cond, timeout);
 		fiber_set_cancellable(cancellable);
-		if (cwp.is_confirm || cwp.is_rollback)
-			goto complete;
+		if (cwp.is_confirm || cwp.is_rollback) {
+			*is_rollback = cwp.is_rollback;
+			rc = 0;
+			break;
+		}
 		if (rc != 0)
-			goto timed_out;
+			break;
+		timeout = deadline - fiber_clock();
 	}
-timed_out:
-	/* Clear the triggers if the timeout has been reached. */
 	trigger_clear(&on_complete);
 	trigger_clear(&on_rollback);
-	diag_set(ClientError, ER_SYNC_QUORUM_TIMEOUT);
-	return -1;
+	return rc;
+}
 
-complete:
-	if (!cwp.is_confirm) {
+int
+txn_limbo_wait_confirm(struct txn_limbo *limbo)
+{
+	if (txn_limbo_is_empty(limbo))
+		return 0;
+	bool is_rollback;
+	if (txn_limbo_wait_last_txn(limbo, &is_rollback,
+				    replication_synchro_timeout) != 0) {
+		diag_set(ClientError, ER_SYNC_QUORUM_TIMEOUT);
+		return -1;
+	}
+	if (is_rollback) {
 		/* The transaction has been rolled back. */
 		diag_set(ClientError, ER_SYNC_ROLLBACK);
 		return -1;
@@ -633,55 +678,82 @@ complete:
 	return 0;
 }
 
+int
+txn_limbo_wait_empty(struct txn_limbo *limbo, double timeout)
+{
+	if (txn_limbo_is_empty(limbo))
+		return 0;
+	bool is_rollback;
+	double deadline = fiber_clock() + timeout;
+	/*
+	 * Retry in the loop. More transactions might be added while waiting for
+	 * the last one.
+	 */
+	do {
+		if (txn_limbo_wait_last_txn(limbo, &is_rollback,
+					    timeout) != 0) {
+			diag_set(ClientError, ER_TIMEOUT);
+			return -1;
+		}
+		timeout = deadline - fiber_clock();
+	} while (!txn_limbo_is_empty(limbo));
+	return 0;
+}
+
 void
 txn_limbo_process(struct txn_limbo *limbo, const struct synchro_request *req)
 {
-	if (req->replica_id != limbo->owner_id) {
+	uint64_t term = req->term;
+	uint32_t origin = req->origin_id;
+	if (txn_limbo_replica_term(limbo, origin) < term) {
+		vclock_follow(&limbo->promote_term_map, origin, term);
+		if (term > limbo->promote_greatest_term) {
+			limbo->promote_greatest_term = term;
+		} else if (req->type == IPROTO_PROMOTE) {
+			/*
+			 * PROMOTE for outdated term. Ignore.
+			 */
+			return;
+		}
+	}
+	int64_t lsn = req->lsn;
+	if (req->replica_id == REPLICA_ID_NIL) {
+		/*
+		 * The limbo was empty on the instance issuing the request.
+		 * This means this instance must empty its limbo as well.
+		 */
+		assert(lsn == 0 && req->type == IPROTO_PROMOTE);
+	} else if (req->replica_id != limbo->owner_id) {
 		/*
 		 * Ignore CONFIRM/ROLLBACK messages for a foreign master.
 		 * These are most likely outdated messages for already confirmed
 		 * data from an old leader, who has just started and written
 		 * confirm right on synchronous transaction recovery.
 		 */
-		return;
+		if (req->type != IPROTO_PROMOTE)
+			return;
+		/*
+		 * Promote has a bigger term, and tries to steal the limbo. It
+		 * means it probably was elected with a quorum, and it makes no
+		 * sense to wait here for confirmations. The other nodes already
+		 * elected a new leader. Rollback all the local txns.
+		 */
+		lsn = 0;
 	}
 	switch (req->type) {
 	case IPROTO_CONFIRM:
-		txn_limbo_read_confirm(limbo, req->lsn);
+		txn_limbo_read_confirm(limbo, lsn);
 		break;
 	case IPROTO_ROLLBACK:
-		txn_limbo_read_rollback(limbo, req->lsn);
+		txn_limbo_read_rollback(limbo, lsn);
+		break;
+	case IPROTO_PROMOTE:
+		txn_limbo_read_promote(limbo, req->origin_id, lsn);
 		break;
 	default:
 		unreachable();
 	}
 	return;
-}
-
-void
-txn_limbo_force_empty(struct txn_limbo *limbo, int64_t confirm_lsn)
-{
-	struct txn_limbo_entry *e, *last_quorum = NULL;
-	struct txn_limbo_entry *rollback = NULL;
-	rlist_foreach_entry(e, &limbo->queue, in_queue) {
-		if (txn_has_flag(e->txn, TXN_WAIT_ACK)) {
-			if (e->lsn <= confirm_lsn) {
-				last_quorum = e;
-			} else {
-				rollback = e;
-				break;
-			}
-		}
-	}
-
-	if (last_quorum != NULL) {
-		txn_limbo_write_confirm(limbo, last_quorum->lsn);
-		txn_limbo_read_confirm(limbo, last_quorum->lsn);
-	}
-	if (rollback != NULL) {
-		txn_limbo_write_rollback(limbo, rollback->lsn);
-		txn_limbo_read_rollback(limbo, rollback->lsn);
-	}
 }
 
 void
@@ -695,8 +767,7 @@ txn_limbo_on_parameters_change(struct txn_limbo *limbo)
 		assert(e->ack_count <= VCLOCK_MAX);
 		if (!txn_has_flag(e->txn, TXN_WAIT_ACK)) {
 			assert(e->lsn == -1);
-			if (confirm_lsn == -1)
-				continue;
+			continue;
 		} else if (e->ack_count < replication_synchro_quorum) {
 			continue;
 		} else {

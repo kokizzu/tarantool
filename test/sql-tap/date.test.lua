@@ -29,7 +29,8 @@ test:plan(0)
 
 -- Disabled until #3694 is resolved.
 --
-if false then
+local is_gh_3694_closed = false
+if is_gh_3694_closed then
 local function datetest(tnum, expr, result)
     test:do_test(
         "date-"..tnum,
@@ -40,7 +41,6 @@ local function datetest(tnum, expr, result)
         result)
 end
 
-local tcl_precision = 15
 datetest(1.1, "julianday('2000-01-01')", "2451544.5")
 datetest(1.2, "julianday('1970-01-01')", "2440587.5")
 datetest(1.3, "julianday('1910-04-20')", "2418781.5")
@@ -234,13 +234,13 @@ datetest(5.15, "datetime('1994-04-16 14:00:00 +05:00 Z')", "NULL")
 -- and in New York.)
 --
 -- On non-Vista Windows platform, '2006-03-31' is treated incorrectly as being
--- in DST giving a 4 hour offset instead of 5.  In 2007, DST was extended to 
+-- in DST giving a 4 hour offset instead of 5.  In 2007, DST was extended to
 -- start three weeks earlier (second Sunday in March) and end one week
 -- later (first Sunday in November).  Older Windows systems apply this
 -- new rule incorrectly to dates prior to 2007.
 --
 -- It might be argued that this is masking a problem on non-Vista Windows
--- platform.  A ticket has already been opened for this issue 
+-- platform.  A ticket has already been opened for this issue
 -- (http://www.sql.org/cvstrac/tktview?tn=2322).  This is just to prevent
 -- more confusion/reports of the issue.
 --

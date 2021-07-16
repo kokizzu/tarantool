@@ -44,7 +44,7 @@
  * a valid data incomes.
  */
 const char *
-raft_state_str(uint32_t state)
+raft_state_str(uint64_t state)
 {
 	static const char *str[] = {
 		[0]			= "invalid (0)",
@@ -322,7 +322,8 @@ raft_process_msg(struct raft *raft, const struct raft_msg *req, uint32_t source)
 	/* Outdated request. */
 	if (req->term < raft->volatile_term) {
 		say_info("RAFT: the message is ignored due to outdated term - "
-			 "current term is %u", raft->volatile_term);
+			 "current term is %llu",
+			 (long long)raft->volatile_term);
 		return 0;
 	}
 
@@ -405,7 +406,8 @@ raft_process_msg(struct raft *raft, const struct raft_msg *req, uint32_t source)
 			raft_sm_become_leader(raft);
 			break;
 		default:
-			unreachable();
+			panic("RAFT: unreacheable state hit");
+			break;
 		}
 	}
 	if (req->state != RAFT_STATE_LEADER) {
@@ -653,7 +655,7 @@ raft_sm_become_candidate(struct raft *raft)
 static void
 raft_sm_schedule_new_term(struct raft *raft, uint64_t new_term)
 {
-	say_info("RAFT: bump term to %llu, follow", new_term);
+	say_info("RAFT: bump term to %llu, follow", (long long)new_term);
 	assert(new_term > raft->volatile_term);
 	assert(raft->volatile_term >= raft->term);
 	raft->volatile_term = new_term;
@@ -686,10 +688,9 @@ static void
 raft_sm_schedule_new_election(struct raft *raft)
 {
 	say_info("RAFT: begin new election round");
-	assert(raft_is_fully_on_disk(raft));
 	assert(raft->is_candidate);
 	/* Everyone is a follower until its vote for self is persisted. */
-	raft_sm_schedule_new_term(raft, raft->term + 1);
+	raft_sm_schedule_new_term(raft, raft->volatile_term + 1);
 	raft_sm_schedule_new_vote(raft, raft->self);
 }
 
@@ -700,6 +701,11 @@ raft_sm_schedule_new_election_cb(struct ev_loop *loop, struct ev_timer *timer,
 	(void)events;
 	struct raft *raft = timer->data;
 	assert(timer == &raft->timer);
+	/*
+	 * Otherwise the timer would be stopped and the callback wouldn't be
+	 * invoked.
+	 */
+	assert(raft_is_fully_on_disk(raft));
 	raft_ev_timer_stop(loop, timer);
 	raft_sm_schedule_new_election(raft);
 }
@@ -848,38 +854,69 @@ raft_cfg_is_enabled(struct raft *raft, bool is_enabled)
 void
 raft_cfg_is_candidate(struct raft *raft, bool is_candidate)
 {
-	bool old_is_candidate = raft->is_candidate;
 	raft->is_cfg_candidate = is_candidate;
-	raft->is_candidate = is_candidate && raft->is_enabled;
-	if (raft->is_candidate == old_is_candidate)
-		return;
+	is_candidate = is_candidate && raft->is_enabled;
+	if (is_candidate)
+		raft_start_candidate(raft);
+	else
+		raft_stop_candidate(raft, true);
+}
 
-	if (raft->is_candidate) {
-		assert(raft->state == RAFT_STATE_FOLLOWER);
-		if (raft->is_write_in_progress) {
-			/*
-			 * If there is an on-going WAL write, it means there was
-			 * some node who sent newer data to this node. So it is
-			 * probably a better candidate. Anyway can't do anything
-			 * until the new state is fully persisted.
-			 */
-		} else if (raft->leader != 0) {
-			raft_sm_wait_leader_dead(raft);
-		} else {
-			raft_sm_wait_leader_found(raft);
-		}
+void
+raft_start_candidate(struct raft *raft)
+{
+	if (raft->is_candidate)
+		return;
+	raft->is_candidate = true;
+	assert(raft->state != RAFT_STATE_CANDIDATE);
+	/*
+	 * May still be the leader after raft_stop_candidate
+	 * with do_demote = false.
+	 */
+	if (raft->state == RAFT_STATE_LEADER)
+		return;
+	if (raft->is_write_in_progress) {
+		/*
+		 * If there is an on-going WAL write, it means there was
+		 * some node who sent newer data to this node. So it is
+		 * probably a better candidate. Anyway can't do anything
+		 * until the new state is fully persisted.
+		 */
+	} else if (raft->leader != 0) {
+		raft_sm_wait_leader_dead(raft);
 	} else {
-		if (raft->state != RAFT_STATE_LEADER) {
-			/* Do not wait for anything while being a voter. */
-			raft_ev_timer_stop(raft_loop(), &raft->timer);
+		raft_sm_wait_leader_found(raft);
+	}
+}
+
+void
+raft_stop_candidate(struct raft *raft, bool do_demote)
+{
+	/*
+	 * May still be the leader after raft_stop_candidate
+	 * with do_demote = false.
+	 */
+	if (!raft->is_candidate && raft->state != RAFT_STATE_LEADER)
+		return;
+	raft->is_candidate = false;
+	if (raft->state != RAFT_STATE_LEADER) {
+		/* Do not wait for anything while being a voter. */
+		raft_ev_timer_stop(raft_loop(), &raft->timer);
+	}
+	if (raft->state != RAFT_STATE_FOLLOWER) {
+		if (raft->state == RAFT_STATE_LEADER) {
+			if (!do_demote) {
+				/*
+				 * Remain leader until someone
+				 * triggers new elections.
+				 */
+				return;
+			}
+			raft->leader = 0;
 		}
-		if (raft->state != RAFT_STATE_FOLLOWER) {
-			if (raft->state == RAFT_STATE_LEADER)
-				raft->leader = 0;
-			raft->state = RAFT_STATE_FOLLOWER;
-			/* State is visible and changed - broadcast. */
-			raft_schedule_broadcast(raft);
-		}
+		raft->state = RAFT_STATE_FOLLOWER;
+		/* State is visible and changed - broadcast. */
+		raft_schedule_broadcast(raft);
 	}
 }
 

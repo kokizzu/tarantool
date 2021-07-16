@@ -44,6 +44,8 @@ struct raft box_raft_global = {
 	.state = 0,
 };
 
+enum election_mode box_election_mode = ELECTION_MODE_INVALID;
+
 /**
  * A trigger executed each time the Raft state machine updates any
  * of its visible attributes.
@@ -86,18 +88,15 @@ box_raft_update_synchro_queue(struct raft *raft)
 {
 	assert(raft == box_raft());
 	/*
-	 * If the node became a leader, it means it will ignore all records from
-	 * all the other nodes, and won't get late CONFIRM messages anyway. Can
-	 * clear the queue without waiting for confirmations.
-	 * It's alright that the user may have called clear_synchro_queue
-	 * manually. In this case the call below will exit immediately and we'll
-	 * simply log a warning.
+	 * In case these are manual elections, we are already in the middle of a
+	 * `promote` call. No need to call it once again.
 	 */
-	if (raft->state == RAFT_STATE_LEADER) {
+	if (raft->state == RAFT_STATE_LEADER &&
+	    box_election_mode != ELECTION_MODE_MANUAL) {
 		int rc = 0;
 		uint32_t errcode = 0;
 		do {
-			rc = box_clear_synchro_queue(false);
+			rc = box_promote();
 			if (rc != 0) {
 				struct error *err = diag_last_error(diag_get());
 				errcode = box_error_code(err);
@@ -156,8 +155,7 @@ box_raft_schedule_async(struct raft *raft)
 	 * adapted to this. Also don't wakeup the current fiber - it leads to
 	 * undefined behaviour.
 	 */
-	if ((box_raft_worker->flags & FIBER_IS_CANCELLABLE) != 0 &&
-	    fiber() != box_raft_worker)
+	if ((box_raft_worker->flags & FIBER_IS_CANCELLABLE) != 0)
 		fiber_wakeup(box_raft_worker);
 	box_raft_has_work = true;
 }
@@ -280,13 +278,6 @@ box_raft_broadcast(struct raft *raft, const struct raft_msg *msg)
 		relay_push_raft(replica->relay, &req);
 }
 
-/** Wakeup Raft state writer fiber waiting for WAL write end. */
-static void
-box_raft_write_cb(struct journal_entry *entry)
-{
-	fiber_wakeup(entry->complete_data);
-}
-
 static void
 box_raft_write(struct raft *raft, const struct raft_msg *msg)
 {
@@ -308,30 +299,59 @@ box_raft_write(struct raft *raft, const struct raft_msg *msg)
 
 	if (xrow_encode_raft(&row, region, &req) != 0)
 		goto fail;
-	journal_entry_create(entry, 1, xrow_approx_len(&row), box_raft_write_cb,
-			     fiber());
+	journal_entry_create(entry, 1, xrow_approx_len(&row),
+			     journal_entry_fiber_wakeup_cb, fiber());
 
 	/*
 	 * A non-cancelable fiber is considered non-wake-able, generally. Raft
 	 * follows this pattern of 'protection'.
 	 */
 	bool cancellable = fiber_set_cancellable(false);
-	bool ok = (journal_write(entry) == 0 && entry->res >= 0);
+	bool is_err = journal_write(entry) != 0;
 	fiber_set_cancellable(cancellable);
-	if (!ok) {
-		diag_set(ClientError, ER_WAL_IO);
-		diag_log();
+	if (is_err)
+		goto fail;
+	if (entry->res < 0) {
+		diag_set_journal_res(entry->res);
 		goto fail;
 	}
 
 	region_truncate(region, svp);
 	return;
 fail:
+	diag_log();
 	/*
 	 * XXX: the stub is supposed to be removed once it is defined what to do
 	 * when a raft request WAL write fails.
 	 */
 	panic("Could not write a raft request to WAL\n");
+}
+
+static int
+box_raft_wait_leader_found_f(struct trigger *trig, void *event)
+{
+	struct raft *raft = event;
+	assert(raft == box_raft());
+	struct fiber *waiter = trig->data;
+	if (raft->leader != REPLICA_ID_NIL || !raft->is_enabled)
+		fiber_wakeup(waiter);
+	return 0;
+}
+
+int
+box_raft_wait_leader_found(void)
+{
+	struct trigger trig;
+	trigger_create(&trig, box_raft_wait_leader_found_f, fiber(), NULL);
+	raft_on_update(box_raft(), &trig);
+	fiber_yield();
+	trigger_clear(&trig);
+	if (fiber_is_cancelled()) {
+		diag_set(FiberIsCancelled);
+		return -1;
+	}
+	assert(box_raft()->leader != REPLICA_ID_NIL || !box_raft()->is_enabled);
+	return 0;
 }
 
 void

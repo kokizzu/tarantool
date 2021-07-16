@@ -38,6 +38,7 @@
 #include "txn.h"
 #include "rmean.h"
 #include "info/info.h"
+#include "memtx_tx.h"
 
 /* {{{ Utilities. **********************************************/
 
@@ -495,6 +496,11 @@ index_create(struct index *index, struct engine *engine,
 	index->def = def;
 	index->refs = 1;
 	index->space_cache_version = space_cache_version;
+	static uint32_t unique_id = 0;
+	index->unique_id = unique_id++;
+	/* Unusable until set to proper value during space creation. */
+	index->dense_id = UINT32_MAX;
+	rlist_create(&index->nearby_gaps);
 	return 0;
 }
 
@@ -508,6 +514,7 @@ index_delete(struct index *index)
 	 * the index is primary or secondary.
 	 */
 	struct index_def *def = index->def;
+	memtx_tx_on_index_delete(index);
 	index->vtab->destroy(index);
 	index_def_delete(def);
 }
@@ -693,12 +700,13 @@ generic_index_get(struct index *index, const char *key,
 int
 generic_index_replace(struct index *index, struct tuple *old_tuple,
 		      struct tuple *new_tuple, enum dup_replace_mode mode,
-		      struct tuple **result)
+		      struct tuple **result, struct tuple **successor)
 {
 	(void)old_tuple;
 	(void)new_tuple;
 	(void)mode;
 	(void)result;
+	(void)successor;
 	diag_set(UnsupportedIndexFeature, index->def, "replace()");
 	return -1;
 }
@@ -762,7 +770,7 @@ generic_index_build_next(struct index *index, struct tuple *tuple)
 	 */
 	if (index_reserve(index, 0) != 0)
 		return -1;
-	return index_replace(index, NULL, tuple, DUP_INSERT, &unused);
+	return index_replace(index, NULL, tuple, DUP_INSERT, &unused, &unused);
 }
 
 void
@@ -780,11 +788,12 @@ disabled_index_build_next(struct index *index, struct tuple *tuple)
 int
 disabled_index_replace(struct index *index, struct tuple *old_tuple,
 		       struct tuple *new_tuple, enum dup_replace_mode mode,
-		       struct tuple **result)
+		       struct tuple **result, struct tuple **successor)
 {
 	(void) old_tuple; (void) new_tuple; (void) mode;
 	(void) index;
 	*result = NULL;
+	*successor = NULL;
 	return 0;
 }
 

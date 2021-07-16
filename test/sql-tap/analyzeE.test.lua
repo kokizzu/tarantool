@@ -2,8 +2,6 @@
 local test = require("sqltester")
 test:plan(48)
 
-local testprefix = "analyzeE"
-
 --!./tcltestrunner.lua
 -- 2014-10-08
 --
@@ -283,7 +281,7 @@ test:do_execsql_test(
         ANALYZE;
     ]], {
         -- <analyzeE-3.0>
-        
+
         -- </analyzeE-3.0>
     })
 
@@ -407,7 +405,7 @@ test:do_execsql_test(
         ANALYZE;
     ]], {
         -- <analyzeE-4.0>
-        
+
         -- </analyzeE-4.0>
     })
 

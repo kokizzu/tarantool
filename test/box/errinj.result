@@ -43,7 +43,8 @@ end
 ...
 evals
 ---
-- - ERRINJ_APPLIER_SLOW_ACK: false
+- - ERRINJ_APPLIER_READ_TX_ROW_DELAY: false
+  - ERRINJ_APPLIER_SLOW_ACK: false
   - ERRINJ_AUTO_UPGRADE: false
   - ERRINJ_BUILD_INDEX: -1
   - ERRINJ_BUILD_INDEX_DELAY: false
@@ -57,7 +58,9 @@ evals
   - ERRINJ_HTTP_RESPONSE_ADD_WAIT: false
   - ERRINJ_INDEX_ALLOC: false
   - ERRINJ_INDEX_RESERVE: false
+  - ERRINJ_IPROTO_SINGLE_THREAD_STAT: -1
   - ERRINJ_IPROTO_TX_DELAY: false
+  - ERRINJ_IPROTO_WRITE_ERROR_DELAY: false
   - ERRINJ_LOG_ROTATE: false
   - ERRINJ_MEMTX_DELAY_GC: false
   - ERRINJ_PORT_DUMP: false
@@ -72,8 +75,10 @@ evals
   - ERRINJ_REPLICA_JOIN_DELAY: false
   - ERRINJ_SIO_READ_MAX: -1
   - ERRINJ_SNAP_COMMIT_DELAY: false
+  - ERRINJ_SNAP_COMMIT_FAIL: false
   - ERRINJ_SNAP_WRITE_DELAY: false
   - ERRINJ_SQL_NAME_NORMALIZATION: false
+  - ERRINJ_STDIN_ISATTY: -1
   - ERRINJ_SWIM_FD_ONLY: false
   - ERRINJ_TESTING: false
   - ERRINJ_TUPLE_ALLOC: false
@@ -895,7 +900,7 @@ box.schema.user.revoke('guest', 'read', 'space', '_space')
 ...
 run()
 ---
-- error: Can't start a checkpoint while in cascading rollback
+- error: WAL has a rollback in progress
 ...
 ch:get()
 ---

@@ -31,7 +31,6 @@ local function lrange(arr, start_num, end_num)
     return tmp
 end
 
-local ii
 test:do_execsql_test(
     "tkt-38cb5df375.0",
     [[
@@ -42,7 +41,7 @@ test:do_execsql_test(
         INSERT INTO t1 SELECT a+4 FROM t1;
     ]], {
         -- <tkt-38cb5df375.0>
-        
+
         -- </tkt-38cb5df375.0>
     })
 

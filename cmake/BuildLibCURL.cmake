@@ -77,7 +77,7 @@ macro(curl_build)
 
     # Switch off the group of protocols with special flag HTTP_ONLY:
     #   ftp, file, ldap, ldaps, rtsp, dict, telnet, tftp, pop3, imap, smtp.
-    list(APPEND LIBCURL_CMAKE_FLAGS "-DHTTP_ONLY=ON")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DHTTP_ONLY=OFF")
 
     # Additionaly disable some more protocols.
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_SMB=ON")
@@ -142,7 +142,7 @@ macro(curl_build)
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_TFTP=ON")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_POP3=ON")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_IMAP=ON")
-    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_SMTP=ON")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_SMTP=OFF")
 
     include(ExternalProject)
     ExternalProject_Add(
@@ -154,7 +154,7 @@ macro(curl_build)
         STAMP_DIR ${LIBCURL_BINARY_DIR}/stamp
         BINARY_DIR ${LIBCURL_BINARY_DIR}/curl
         CONFIGURE_COMMAND
-            cd <BINARY_DIR> && cmake <SOURCE_DIR>
+            cd <BINARY_DIR> && ${CMAKE_COMMAND} <SOURCE_DIR>
                 ${LIBCURL_CMAKE_FLAGS}
         BUILD_COMMAND cd <BINARY_DIR> && $(MAKE)
         INSTALL_COMMAND cd <BINARY_DIR> && $(MAKE) install)

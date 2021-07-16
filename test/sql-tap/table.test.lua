@@ -29,7 +29,7 @@ test:do_execsql_test(
         )
     ]], {
         -- <table-1.1>
-        
+
         -- </table-1.1>
     })
 
@@ -62,7 +62,7 @@ test:do_test(
         --execsql {SELECT * FROM sql_master WHERE type!='meta'}
     end, {
         -- <table-1.5>
-        
+
         -- </table-1.5>
     })
 
@@ -83,7 +83,7 @@ test:do_test(
         --execsql {SELECT name FROM sql_master WHERE type!='meta'}
     end, {
         -- <table-1.10>
-        
+
         -- </table-1.10>
     })
 
@@ -95,7 +95,7 @@ test:do_test(
         --execsql {SELECT name FROM "sql_master" WHERE type!='meta'}
     end, {
         -- <table-1.11>
-        
+
         -- </table-1.11>
     })
 
@@ -106,7 +106,7 @@ test:do_test(
         --execsql {SELECT name as "X" FROM sql_master WHERE type!='meta'}
     end, {
         -- <table-1.12>
-        
+
         -- </table-1.12>
     })
 
@@ -118,7 +118,7 @@ test:do_test(
         --execsql {SELECT name FROM "sql_master" WHERE type!='meta'}
     end, {
         -- <table-1.13>
-        
+
         -- </table-1.13>
     })
 
@@ -171,7 +171,7 @@ test:do_execsql_test(
         DROP TABLE test2; --SELECT name FROM sql_master WHERE type!='meta'
     ]], {
         -- <table-2.1f>
-        
+
         -- </table-2.1f>
     })
 
@@ -185,7 +185,7 @@ test:do_test(
         --catchsql {CREATE TABLE test3(id primary key, two text)}
     end, {
         -- <table-2.2a>
-        
+
         -- </table-2.2a>
     })
 
@@ -220,7 +220,7 @@ test:do_test(
         --execsql {SELECT name FROM sql_master WHERE type!='meta' ORDER BY name}
     end, {
         -- <table-2.2f>
-        
+
         -- </table-2.2f>
     })
 
@@ -255,7 +255,7 @@ test:do_test(
         --execsql {SELECT sql FROM sql_master WHERE type=='table'}
     end, {
         -- <table-3.1>
-        
+
         -- </table-3.1>
     })
 
@@ -303,7 +303,7 @@ test:do_test(
         --execsql {SELECT name FROM sql_master WHERE type!='meta'}
     end, {
         -- <table-3.6>
-        
+
         -- </table-3.6>
     })
 
@@ -365,7 +365,7 @@ test:do_test(
         return test:execsql [[SELECT "name" FROM "_space" WHERE "id">500]]
     end, {
         -- <table-4.3>
-        
+
         -- </table-4.3>
     })
 
@@ -417,14 +417,14 @@ test:do_test(
 
 test:drop_all_tables()
 -- MUST_WORK_TEST
-if (0 > 0)
+-- testcase is broken
+-- https://github.com/tarantool/tarantool/issues/5742
+local is_gh_5742_closed = false
+if is_gh_5742_closed
  then
     test:do_test(
         "table-5.2.2",
         function()
-            db("close")
-            forcedelete("test.db")
-            sql("db", "test.db")
             return test:execsql [[
                 CREATE TABLE t0(a,b);
                 CREATE INDEX t ON t0(a);
@@ -436,13 +436,13 @@ if (0 > 0)
             ]]
         end, {
             -- <table-5.2.2>
-            
+
             -- </table-5.2.2>
         })
 
-    db("close")
-    forcedelete("test.db")
-    sql("db", "test.db")
+    -- Legacy from the original code. Must be replaced with analogue
+    -- functions from box.
+    local X = nil
     X(313, "X!cmd", [=[["Make","sure","an","EXPLAIN","does","not","really","create","a","new","table"]]=])
 end
 test:do_test(
@@ -455,7 +455,7 @@ test:do_test(
         --execsql {SELECT name FROM sql_master WHERE type!='meta'}
     end, {
         -- <table-5.3>
-        
+
         -- </table-5.3>
     })
 
@@ -484,7 +484,7 @@ test:do_test(
 --  set list [glob -nocomplain testdb/spaces*.tbl]
 --} {testdb/spaces+in+this+name+.tbl}
 -- Try using keywords as table names or column names.
--- 
+--
 test:do_catchsql_test(
     "table-7.1",
     [=[
@@ -947,7 +947,8 @@ test:do_execsql_test(
 --
 --  Disabled until #3694 is resolved.
 --
-if false then
+local is_gh_3694_closed = false
+if is_gh_3694_closed then
 test:do_execsql_test(
     "table-13.1",
     [[
@@ -960,7 +961,7 @@ test:do_execsql_test(
         SELECT * FROM tablet8;
     ]], {
         -- <table-13.1>
-        
+
         -- </table-13.1>
     })
 end
@@ -1009,7 +1010,7 @@ test:do_test(
     })
 end
 -- ifcapable attach {
---   # Now attach a database and ensure that a table can be created in the 
+--   # Now attach a database and ensure that a table can be created in the
 --   # attached database whilst in a callback from a query on the main database.
 --   do_test table-14.3 {
 --     forcedelete test2.db
@@ -1021,7 +1022,7 @@ end
 --       db eval {CREATE TABLE aux.t1(a, b, c)}
 --     }
 --   } {}
---   # On the other hand, it should be impossible to drop a table when any VMs 
+--   # On the other hand, it should be impossible to drop a table when any VMs
 --   # are active. This is because VerifyCookie instructions may have already
 --   # been executed, and btree root-pages may not move after this (which a
 --   # delete table might do).
@@ -1032,7 +1033,7 @@ end
 --           db eval {DROP TABLE aux.t1;}
 --         }
 --       } msg
---     ] 
+--     ]
 --     set result [list $rc $msg]
 --   } {1 {database table is locked}}
 -- }
@@ -1052,7 +1053,7 @@ test:do_test(
         return
     end, {
         -- <table-15.1>
-        
+
         -- </table-15.1>
     })
 
@@ -1067,7 +1068,7 @@ test:do_test(
         return
     end, {
         -- <table-15.2>
-        
+
         -- </table-15.2>
     })
 
@@ -1211,7 +1212,7 @@ test:do_catchsql_test(
         INSERT INTO T21 VALUES(1, 2, 2);
     ]], {
         -- <table-21.2>
-        1, "Duplicate key exists in unique index 'pk_unnamed_T21_1' in space 'T21'"
+        1, "Duplicate key exists in unique index \"pk_unnamed_T21_1\" in space \"T21\" with old tuple - [1, 1, 1] and new tuple - [1, 2, 2]"
         -- </table-21.2>
     })
 
@@ -1283,7 +1284,7 @@ test:do_catchsql_test(
         INSERT INTO T22 VALUES(2, 1, 1);
     ]], {
         -- <table-22.3>
-        1,"Duplicate key exists in unique index 'ONE' in space 'T22'"
+        1, "Duplicate key exists in unique index \"ONE\" in space \"T22\" with old tuple - [1, 1, 1] and new tuple - [2, 1, 1]"
         -- </table-22.3>
     })
 
@@ -1308,7 +1309,7 @@ test:do_catchsql_test(
         INSERT INTO T24 VALUES(2, 1, 1);
     ]], {
         -- <table-22.5>
-        1, "Duplicate key exists in unique index 'TWO' in space 'T24'"
+        1, "Duplicate key exists in unique index \"TWO\" in space \"T24\" with old tuple - [1, 1, 1] and new tuple - [2, 1, 1]"
         -- </table-22.5>
     })
 
@@ -1362,7 +1363,7 @@ test:do_catchsql_test(
         INSERT INTO T28 VALUES(11);
     ]], {
         -- <table-22.9>
-        1,"Duplicate key exists in unique index 'pk_unnamed_T28_1' in space 'T28'"
+        1, "Duplicate key exists in unique index \"pk_unnamed_T28_1\" in space \"T28\" with old tuple - [11] and new tuple - [11]"
         -- </table-22.9>
     })
 

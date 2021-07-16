@@ -17,7 +17,7 @@ test:plan(4)
 -- This file implements regression tests for sql library.
 --
 -- This file implements tests to verify that ticket #2192 has been
--- fixed.  
+-- fixed.
 --
 --
 -- $Id: tkt2192.test,v 1.3 2008/08/04 03:51:24 danielk1977 Exp $
@@ -26,7 +26,8 @@ test:plan(4)
 
 --  Disabled until #3694 is resolved.
 --
-if false then
+local is_gh_3694_closed = false
+if is_gh_3694_closed then
 test:do_execsql_test(
     "tkt2192-1.1",
     [[
@@ -91,7 +92,7 @@ test:do_execsql_test(
           select * from jan join nov on (jan.expense = nov.expense);
     ]], {
         -- <tkt2192-1.1>
-        
+
         -- </tkt2192-1.1>
     })
 

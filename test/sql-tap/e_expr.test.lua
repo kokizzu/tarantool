@@ -1077,19 +1077,33 @@ test:do_execsql_test(
 --
 -- MUST_WORK_TEST prepared statements
 if (0>0) then
-    local function parameter_test(tn, sql, params, result)
-        local stmt = sql_prepare_v2("db", sql, -1)
+    local function parameter_test(tn, sql, params, result) -- luacheck: no unused
+        -- Legacy from the original code. Must be replaced with analogue
+        -- functions from box.
+        local X = nil
+        local sql_prepare_v2 = nil
+        local sql_bind_parameter_name = nil
+        local sql_bind_int = nil
+        local number = nil
+        local stmt = sql_prepare_v2(sql, -1)
         for _ in X(0, "X!foreach", [=[["number name",["params"]]]=]) do
-            local nm = sql_bind_parameter_name(stmt, number)
+            sql_bind_parameter_name(stmt, number)
             X(480, "X!cmd", [=[["do_test",[["tn"],".name.",["number"]],[["list","set","",["nm"]]],["name"]]]=])
             sql_bind_int(stmt, number, ((-1) * number))
         end
+        -- Legacy from the original code. Must be replaced with analogue
+        -- functions from box.
+        local sql_column_text = nil
+        local sql_step = nil
         sql_step(stmt)
         local res = {  }
-        for _ in X(0, "X!for", [=[["set i 0","$i < [sql_column_count $stmt]","incr i"]]=]) do
+        for i in X(0, "X!for", [=[["set i 0","$i < [sql_column_count $stmt]","incr i"]]=]) do
             table.insert(res,sql_column_text(stmt, i))
         end
-        local rc = sql_finalize(stmt)
+        -- Legacy from the original code. Must be replaced with analogue
+        -- functions from box.
+        local sql_finalize = nil
+        sql_finalize(stmt)
         X(491, "X!cmd", [=[["do_test",[["tn"],".rc"],[["list","set","",["rc"]]],"sql_OK"]]=])
         X(492, "X!cmd", [=[["do_test",[["tn"],".res"],[["list","set","",["res"]]],["result"]]]=])
     end
@@ -1123,10 +1137,15 @@ if (0>0) then
     -- EVIDENCE-OF: R-14068-49671 Parameters that are not assigned values
     -- using sql_bind() are treated as NULL.
     --
+    -- Legacy from the original code. Must be replaced with analogue
+    -- functions from box.
+    local sql_prepare_v2 = nil
+    local sql_column_type = nil
+    local sql_step = nil
     test:do_test(
         "e_expr-11.7.1",
         function()
-            local stmt = sql_prepare_v2("db", " SELECT ?, :a, @b, ?d ", -1)
+            local stmt = sql_prepare_v2(" SELECT ?, :a, @b, ?d ", -1)
             sql_step(stmt)
             return { sql_column_type(stmt, 0), sql_column_type(stmt, 1), sql_column_type(stmt, 2), sql_column_type(stmt, 3) }
         end, {
@@ -1135,6 +1154,9 @@ if (0>0) then
             -- </e_expr-11.7.1>
         })
 
+    -- Legacy from the original code. Must be replaced with analogue
+    -- functions from box.
+    local stmt = nil
     test:do_sql_finalize_test(
         "e_expr-11.7.1",
         stmt, {
@@ -1264,7 +1286,7 @@ test:do_execsql_test(
 test:execsql [[
     CREATE TABLE tblname(cname INT PRIMARY KEY);
 ]]
-local function glob(args)
+local function glob()
     return 1
 end
 
@@ -1400,7 +1422,7 @@ for _, val in ipairs(test_cases12) do
         test:do_test(
             string.format("e_expr-12.3.%s.%s", tn, x),
             function()
-                local rc, err = pcall( function()
+                local rc = pcall( function()
                     test:execsql("SELECT "..e.." FROM tblname")
                 end)
                 return rc
@@ -2121,7 +2143,7 @@ test:do_execsql_test(
 local likeargs = {}
 local function likefunc(...)
     local args = {...}
-    for i, v in ipairs(args) do
+    for _, v in ipairs(args) do
         table.insert(likeargs, v)
     end
     return 1
@@ -2170,8 +2192,6 @@ test:do_test(
         "def", "abc", "X"
         -- </e_expr-15.1.4>
     })
---db("close")
---sql("db", "test.db")
 -- EVIDENCE-OF: R-22868-25880 The LIKE operator can be made case
 -- sensitive using the case_sensitive_like pragma.
 --
@@ -2291,6 +2311,8 @@ test:do_execsql_test(
         -- </e_expr-17.2.3>
     })
 
+-- Legacy from the original code. Must be replaced with analogue functions.
+local db = nil
 -- MUST_WORK_TEST uses access to nullvalue... (sql parameters) and built in functions
 if 0>0 then
     db("nullvalue", "null")
@@ -2356,7 +2378,7 @@ end
 local regexpargs = {}
 local function regexpfunc(...)
     local args = {...}
-    for i, v in ipairs(args) do
+    for _, v in ipairs(args) do
         table.insert(regexpargs, v)
     end
     return 1
@@ -2415,7 +2437,7 @@ test:do_test(
 local matchargs = {  }
 local function matchfunc(...)
     local args = {...}
-    for i, v in ipairs(args) do
+    for _, v in ipairs(args) do
         table.insert(matchargs, v)
     end
     return 1
@@ -2489,7 +2511,7 @@ test:do_execsql_test(
         -- </e_expr-20.2>
     })
 
-local a, b, c
+local a, b, c -- luacheck: ignore unused a b c
 a = 0
 b = 0
 c = 0
@@ -2679,6 +2701,10 @@ if 0>0 then
     -- comparisons take place.
     --
 
+    -- Legacy from the original code. Must be replaced with analogue
+    -- functions from box.
+    local X = nil
+    -- luacheck: ignore
     for _ in X(0, "X!foreach", [=[["a b c",[["list",[["expr","3"]],[["expr","4"]],[["expr","5"]]]]]]=]) do
         break
     end
@@ -3164,14 +3190,14 @@ test:do_execsql_test(
         INSERT INTO t1 VALUES(4, NULL, NULL);
     ]], {
         -- <e_expr-34.1>
-        
+
         -- </e_expr-34.1>
     })
 
 -- EVIDENCE-OF: R-25588-27181 The EXISTS operator always evaluates to one
 -- of the integer values 0 and 1.
 --
--- This statement is not tested by itself. Instead, all e_expr-34.* tests 
+-- This statement is not tested by itself. Instead, all e_expr-34.* tests
 -- following this point explicitly test that specific invocations of EXISTS
 -- return either integer 0 or integer 1.
 --
@@ -3245,9 +3271,6 @@ end
 ---------------------------------------------------------------------------
 -- Test statements related to scalar sub-queries.
 --
--- catch { db close }
--- forcedelete test.db
--- sql db test.db
 test:catchsql "DROP TABLE t22;"
 test:do_execsql_test(
     "e_expr-35.0",
@@ -3257,7 +3280,7 @@ test:do_execsql_test(
         INSERT INTO t22 VALUES('three', NULL);
     ]], {
         -- <e_expr-35.0>
-        
+
         -- </e_expr-35.0>
     })
 
@@ -3272,10 +3295,10 @@ do_expr_test("e_expr-35.1.1", " (SELECT 35)   ", "integer", 35)
 do_expr_test("e_expr-35.1.2", " (SELECT NULL) ", "null", "")
 do_expr_test("e_expr-35.1.3", " (SELECT count(*) FROM t22) ", "integer", 2)
 do_expr_test("e_expr-35.1.4", " (SELECT 4 FROM t22 LIMIT 1) ", "integer", 4)
-do_expr_test("e_expr-35.1.5", [[ 
+do_expr_test("e_expr-35.1.5", [[
   (SELECT b FROM t22 UNION SELECT a+1 FROM t22 LIMIT 1)
 ]], "null", "")
-do_expr_test("e_expr-35.1.6", [[ 
+do_expr_test("e_expr-35.1.6", [[
   (SELECT a FROM t22 UNION SELECT COALESCE(b, 55) FROM t22 ORDER BY 1 LIMIT 1)
 ]], "integer", 55)
 -- EVIDENCE-OF: R-46899-53765 A SELECT used as a scalar quantity must
@@ -3316,7 +3339,7 @@ test:do_execsql_test(
         INSERT INTO t4 VALUES(3, 'three');
     ]], {
         -- <e_expr-36.3.1>
-        
+
         -- </e_expr-36.3.1>
     })
 

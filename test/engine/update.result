@@ -622,7 +622,8 @@ space:select{}
 ...
 space:update({1}, {{'=', 2, 2}, {'=', 3, 3}})
 ---
-- error: Duplicate key exists in unique index 'secondary' in space 'test'
+- error: Duplicate key exists in unique index "secondary" in space "test" with old
+    tuple - [2, 2, 2] and new tuple - [1, 2, 3]
 ...
 index1:select{}
 ---
@@ -722,7 +723,8 @@ aa.VAL
 -- invalid update
 aa:update({{'=',2, 666}})
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected string'
+- error: 'Tuple field 2 (VAL) type does not match one required by operation: expected
+    string, got unsigned'
 ...
 -- test transform integrity
 aa:transform(-1, 1)
@@ -753,7 +755,8 @@ box.space.tst_sample:get(2).VAL
 -- invalid upsert
 s:upsert({2, 666}, {{'=', 2, 666}})
 ---
-- error: 'Tuple field 2 type does not match one required by operation: expected string'
+- error: 'Tuple field 2 (VAL) type does not match one required by operation: expected
+    string, got unsigned'
 ...
 s:drop()
 ---
@@ -846,6 +849,363 @@ t:update({{'+', '[1]', 50}})
 s:update({1}, {{'=', 'field3', {d = 30, e = 31, f = 32}}})
 ---
 - [1, [10, 11, 12], {'d': 30, 'f': 32, 'e': 31}, 'abcdefgh', true, -100, 200]
+...
+s:drop()
+---
+...
+--
+-- gh-3378: allow update absent nullable fields
+-- '!'
+s = box.schema.create_space('test', {engine = engine})
+---
+...
+pk = s:create_index('pk')
+---
+...
+s:replace{1, 2}
+---
+- [1, 2]
+...
+s:update({1}, {{'!', 4, 0}})
+---
+- [1, 2, null, 0]
+...
+_ = s:delete({1})
+---
+...
+-- '#'
+s:replace{1, 2}
+---
+- [1, 2]
+...
+s:update({1}, {{'#', 4, 1}})
+---
+- [1, 2]
+...
+s:drop()
+---
+...
+-- Update respects field_count
+s = box.schema.create_space('test', {engine = engine, field_count = 2})
+---
+...
+pk = s:create_index('pk')
+---
+...
+s:replace{1, 2}
+---
+- [1, 2]
+...
+s:update({1}, {{'!', 3, 0}})
+---
+- error: Tuple field count 3 does not match space field count 2
+...
+s:update({1}, {{'=', 3, 0}})
+---
+- error: Tuple field count 3 does not match space field count 2
+...
+s:drop()
+---
+...
+-- '='
+s = box.schema.create_space('test', {engine = engine})
+---
+...
+pk = s:create_index('pk')
+---
+...
+s:replace{1, 2}
+---
+- [1, 2]
+...
+s:update({1}, {{'=', 4, 0}})
+---
+- [1, 2, null, 0]
+...
+s:drop()
+---
+...
+-- Negative field number, fixed field_count
+format = {}
+---
+...
+format[1] = {name = 'field1', type = 'unsigned'}
+---
+...
+format[2] = {name = 'field2', type = 'unsigned'}
+---
+...
+format[3] = {name = 'field3', type = 'unsigned', is_nullable = true}
+---
+...
+format[4] = {name = 'field4', type = 'unsigned', is_nullable = true}
+---
+...
+s = box.schema.create_space('test', {engine = engine, format = format, field_count = 4})
+---
+...
+pk = s:create_index('pk')
+---
+...
+s:replace{1, 2, box.NULL, box.NULL}
+---
+- [1, 2, null, null]
+...
+s:update({1}, {{'!', -1, 42}})
+---
+- error: Tuple field count 5 does not match space field count 4
+...
+s:update({1}, {{'=', -1, 128}})
+---
+- [1, 2, null, 128]
+...
+s:drop()
+---
+...
+-- Negative field number, no field_count
+format = {}
+---
+...
+format[1] = {name = 'field1', type = 'unsigned'}
+---
+...
+format[2] = {name = 'field2', type = 'unsigned'}
+---
+...
+format[3] = {name = 'field3', type = 'unsigned', is_nullable = true}
+---
+...
+format[4] = {name = 'field4', type = 'unsigned', is_nullable = true}
+---
+...
+s = box.schema.create_space('test', {engine = engine, format = format})
+---
+...
+pk = s:create_index('pk')
+---
+...
+s:replace{1, 2}
+---
+- [1, 2]
+...
+s:update({1}, {{'!', -1, 42}})
+---
+- [1, 2, 42]
+...
+s:update({1}, {{'=', -1, 128}})
+---
+- [1, 2, 128]
+...
+s:drop()
+---
+...
+-- '#' doesn't trim nulls
+s = box.schema.create_space('test', {engine = engine})
+---
+...
+pk = s:create_index('pk')
+---
+...
+s:replace{1, 2}
+---
+- [1, 2]
+...
+s:update({1}, {{'!', 4, 0}})
+---
+- [1, 2, null, 0]
+...
+s:update({1}, {{'#', 4, 1}})
+---
+- [1, 2, null]
+...
+s:update({1}, {{'#', 3, 1}})
+---
+- [1, 2]
+...
+s:drop()
+---
+...
+-- Maps (fail if don't exist)
+format = {}
+---
+...
+format[1] = {name = 'field1', type = 'unsigned'}
+---
+...
+format[2] = {name = 'field2', type = 'map'}
+---
+...
+s = box.schema.create_space('test', {engine = engine, format = format})
+---
+...
+pk = s:create_index('pk')
+---
+...
+map = {key1 = 1, key2 = 2}
+---
+...
+s:replace{1, map}
+---
+- [1, {'key1': 1, 'key2': 2}]
+...
+s:update({1}, {{'!', 'field42', 0}})
+---
+- error: Field 'field42' was not found in the tuple
+...
+s:update({1}, {{'!', '[3].key1', 1}})
+---
+- error: Field ''[3].key1'' was not found in the tuple
+...
+s:update({1}, {{'!', 3, 3}})
+---
+- [1, {'key1': 1, 'key2': 2}, 3]
+...
+s:drop()
+---
+...
+-- Arrays (fail if don't exist)
+format = {}
+---
+...
+format[1] = {name = 'field1', type = 'unsigned'}
+---
+...
+format[2] = {name = 'field2', type = 'array'}
+---
+...
+s = box.schema.create_space('test', {engine = engine, format = format})
+---
+...
+pk = s:create_index('pk')
+---
+...
+arr = {11, 22, {111, 222}}
+---
+...
+s:replace{1, arr}
+---
+- [1, [11, 22, [111, 222]]]
+...
+s:update({1}, {{'!', '[2][42]', 0}})
+---
+- error: Field ''[2][42]'' was not found in the tuple
+...
+s:update({1}, {{'!', '[2][3][42]', 0}})
+---
+- error: Field ''[2][3][42]'' was not found in the tuple
+...
+s:drop()
+---
+...
+-- JSON (fail if don't exists)
+format = {}
+---
+...
+format[1] = {'field1', 'unsigned'};
+---
+...
+format[2] = {'field2', 'map'};
+---
+...
+format[3] = {'field3', 'array'};
+---
+...
+s = box.schema.create_space('test', {engine = engine, format = format})
+---
+...
+pk = s:create_index('pk')
+---
+...
+s:replace({1, {key1 = 'value'}, {1, 2}})
+---
+- [1, {'key1': 'value'}, [1, 2]]
+...
+-- it's okey, create new {key2, value} pair in map
+s:update({1}, {{'!', 'field2.key2', 0}})
+---
+- [1, {'key2': 0, 'key1': 'value'}, [1, 2]]
+...
+-- error: field3[5] was not found in the tuple
+s:update({1}, {{'!', 'field3[5]', 0}})
+---
+- error: Field ''field3[5]'' was not found in the tuple
+...
+-- error: field4.key1 was not found in the tuple
+s:update({1}, {{'!', 'field4.key1', 0}})
+---
+- error: Field 'field4.key1' was not found in the tuple
+...
+s:drop()
+---
+...
+--
+-- Autofill of nils is baned for nested arrays.
+--
+s = box.schema.create_space('test', {engine = engine})
+---
+...
+pk = s:create_index('pk')
+---
+...
+s:insert({1, 2, {11, 22}})
+---
+- [1, 2, [11, 22]]
+...
+-- When two operations are used for one array, internally it looks very similar
+-- to how the root array is represented. Still the ban should work.
+op1 = {'=', '[3][1]', 11}
+---
+...
+op2 = {'=', '[3][4]', 44}
+---
+...
+s:update({1}, {op1, op2})
+---
+- error: Field ''[3][4]'' was not found in the tuple
+...
+s:update({1}, {op1})
+---
+- [1, 2, [11, 22]]
+...
+s:update({1}, {op2})
+---
+- error: Field ''[3][4]'' was not found in the tuple
+...
+s:drop()
+---
+...
+format = {}
+---
+...
+format[1] = {name = 'field1', type = 'unsigned'}
+---
+...
+format[2] = {name = 'field2', type = 'unsigned', is_nullable = true}
+---
+...
+format[3] = {name = 'field3', type = 'unsigned', is_nullable = true}
+---
+...
+s = box.schema.create_space('test', {format = format})
+---
+...
+_ = s:create_index('pk')
+---
+...
+t = s:replace({1})
+---
+...
+t:update({{'=', 3, 3}})
+---
+- [1, null, 3]
+...
+t:update({{'=', '[3]', 3}})
+---
+- [1, null, 3]
+...
+t:update({{'=', 'field3', 3}})
+---
+- [1, null, 3]
 ...
 s:drop()
 ---

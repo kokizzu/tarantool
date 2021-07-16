@@ -71,7 +71,8 @@ lbox_ctl_wait_rw(struct lua_State *L)
 static int
 lbox_ctl_on_shutdown(struct lua_State *L)
 {
-	return lbox_trigger_reset(L, 2, &box_on_shutdown, NULL, NULL);
+	return lbox_trigger_reset(L, 2, &box_on_shutdown_trigger_list,
+				  NULL, NULL);
 }
 
 static int
@@ -81,9 +82,9 @@ lbox_ctl_on_schema_init(struct lua_State *L)
 }
 
 static int
-lbox_ctl_clear_synchro_queue(struct lua_State *L)
+lbox_ctl_promote(struct lua_State *L)
 {
-	if (box_clear_synchro_queue(true) != 0)
+	if (box_promote() != 0)
 		return luaT_error(L);
 	return 0;
 }
@@ -94,8 +95,28 @@ lbox_ctl_is_recovery_finished(struct lua_State *L)
 	struct memtx_engine *memtx;
 	memtx = (struct memtx_engine *)engine_by_name("memtx");
 	lua_pushboolean(L, (memtx ?
-		(memtx->state < MEMTX_FINAL_RECOVERY ? 0 : 1) : 0));
+		(memtx->state < MEMTX_OK ? 0 : 1) : 0));
 	return 1;
+}
+
+static int
+lbox_ctl_set_on_shutdown_timeout(struct lua_State *L)
+{
+	int index = lua_gettop(L);
+	if (index != 1) {
+		lua_pushstring(L, "function expected one argument");
+		lua_error(L);
+	}
+
+	double wait_time = luaL_checknumber(L, 1);
+	if (wait_time <= 0) {
+		lua_pushstring(L, "on_shutdown timeout must be greater "
+			       "then zero");
+		lua_error(L);
+	}
+
+	on_shutdown_trigger_timeout = wait_time;
+	return 0;
 }
 
 static const struct luaL_Reg lbox_ctl_lib[] = {
@@ -103,8 +124,11 @@ static const struct luaL_Reg lbox_ctl_lib[] = {
 	{"wait_rw", lbox_ctl_wait_rw},
 	{"on_shutdown", lbox_ctl_on_shutdown},
 	{"on_schema_init", lbox_ctl_on_schema_init},
-	{"clear_synchro_queue", lbox_ctl_clear_synchro_queue},
+	{"promote", lbox_ctl_promote},
+	/* An old alias. */
+	{"clear_synchro_queue", lbox_ctl_promote},
 	{"is_recovery_finished", lbox_ctl_is_recovery_finished},
+	{"set_on_shutdown_timeout", lbox_ctl_set_on_shutdown_timeout},
 	{NULL, NULL}
 };
 

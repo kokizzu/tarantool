@@ -50,9 +50,11 @@
 #include "version.h"
 #include "box/box.h"
 #include "box/raft.h"
+#include "box/txn_limbo.h"
 #include "lua/utils.h"
+#include "lua/serializer.h" /* luaL_setmaphint */
 #include "fiber.h"
-#include "tt_static.h"
+#include "sio.h"
 
 static void
 lbox_pushvclock(struct lua_State *L, const struct vclock *vclock)
@@ -141,6 +143,9 @@ lbox_pushrelay(lua_State *L, struct relay *relay)
 		lua_pushstring(L, "idle");
 		lua_pushnumber(L, ev_monotonic_now(loop()) -
 			       relay_last_row_time(relay));
+		lua_settable(L, -3);
+		lua_pushstring(L, "lag");
+		lua_pushnumber(L, relay_txn_lag(relay));
 		lua_settable(L, -3);
 		break;
 	case RELAY_STOPPED:
@@ -445,6 +450,10 @@ lbox_info_gc_call(struct lua_State *L)
 	lua_pushboolean(L, gc.checkpoint_is_in_progress);
 	lua_settable(L, -3);
 
+	lua_pushstring(L, "is_paused");
+	lua_pushboolean(L, gc.is_paused);
+	lua_settable(L, -3);
+
 	lua_pushstring(L, "checkpoints");
 	lua_newtable(L);
 
@@ -574,7 +583,8 @@ static int
 lbox_info_listen(struct lua_State *L)
 {
 	/* NULL is ok, no need to check. */
-	lua_pushstring(L, iproto_bound_address());
+	char addrbuf[SERVICE_NAME_MAXLEN];
+	lua_pushstring(L, iproto_bound_address(addrbuf));
 	return 1;
 }
 
@@ -593,6 +603,26 @@ lbox_info_election(struct lua_State *L)
 	lua_setfield(L, -2, "leader");
 	return 1;
 }
+
+static int
+lbox_info_synchro(struct lua_State *L)
+{
+	lua_createtable(L, 0, 2);
+
+	/* Quorum value may be evaluated via formula */
+	lua_pushinteger(L, replication_synchro_quorum);
+	lua_setfield(L, -2, "quorum");
+
+	/* Queue information. */
+	struct txn_limbo *queue = &txn_limbo;
+	lua_createtable(L, 0, 1);
+	lua_pushnumber(L, queue->len);
+	lua_setfield(L, -2, "len");
+	lua_setfield(L, -2, "queue");
+
+	return 1;
+}
+
 
 static const struct luaL_Reg lbox_info_dynamic_meta[] = {
 	{"id", lbox_info_id},
@@ -613,6 +643,7 @@ static const struct luaL_Reg lbox_info_dynamic_meta[] = {
 	{"sql", lbox_info_sql},
 	{"listen", lbox_info_listen},
 	{"election", lbox_info_election},
+	{"synchro", lbox_info_synchro},
 	{NULL, NULL}
 };
 

@@ -33,7 +33,7 @@
 #include <msgpuck.h>
 #include <small/region.h>
 #include <small/obuf.h>
-#include "third_party/base64.h"
+#include <base64.h>
 
 #include "fiber.h"
 #include "version.h"
@@ -43,6 +43,7 @@
 #include "scramble.h"
 #include "iproto_constants.h"
 #include "mpstream/mpstream.h"
+#include "errinj.h"
 
 static_assert(IPROTO_DATA < 0x7f && IPROTO_METADATA < 0x7f &&
 	      IPROTO_SQL_INFO < 0x7f, "encoded IPROTO_BODY keys must fit into "\
@@ -183,7 +184,7 @@ error:
 			break;
 		case IPROTO_FLAGS:
 			flags = mp_decode_uint(pos);
-			header->is_commit = flags & IPROTO_FLAG_COMMIT;
+			header->flags = flags;
 			break;
 		default:
 			/* unknown header */
@@ -299,6 +300,7 @@ xrow_header_encode(const struct xrow_header *header, uint64_t sync,
 	 *   flag to find transaction boundary (last row in the
 	 *   transaction stream).
 	 */
+	uint8_t flags_to_encode = header->flags & ~IPROTO_FLAG_COMMIT;
 	if (header->tsn != 0) {
 		if (header->tsn != header->lsn || !header->is_commit) {
 			/*
@@ -314,11 +316,13 @@ xrow_header_encode(const struct xrow_header *header, uint64_t sync,
 			map_size++;
 		}
 		if (header->is_commit && header->tsn != header->lsn) {
-			/* Setup last row for multi row transaction. */
-			d = mp_encode_uint(d, IPROTO_FLAGS);
-			d = mp_encode_uint(d, IPROTO_FLAG_COMMIT);
-			map_size++;
+			flags_to_encode |= IPROTO_FLAG_COMMIT;
 		}
+	}
+	if (flags_to_encode != 0) {
+		d = mp_encode_uint(d, IPROTO_FLAGS);
+		d = mp_encode_uint(d, flags_to_encode);
+		map_size++;
 	}
 	assert(d <= data + XROW_HEADER_LEN_MAX);
 	mp_encode_map(data, map_size);
@@ -356,7 +360,7 @@ static_assert(sizeof(struct iproto_header_bin) == IPROTO_HEADER_LEN,
 	      "sizeof(iproto_header_bin)");
 
 void
-iproto_header_encode(char *out, uint32_t type, uint64_t sync,
+iproto_header_encode(char *out, uint16_t type, uint64_t sync,
 		     uint32_t schema_version, uint32_t body_length)
 {
 	struct iproto_header_bin header;
@@ -446,11 +450,13 @@ iproto_reply_vote(struct obuf *out, const struct ballot *ballot,
 		  uint64_t sync, uint32_t schema_version)
 {
 	size_t max_size = IPROTO_HEADER_LEN + mp_sizeof_map(1) +
-		mp_sizeof_uint(UINT32_MAX) + mp_sizeof_map(5) +
+		mp_sizeof_uint(UINT32_MAX) + mp_sizeof_map(6) +
+		mp_sizeof_uint(UINT32_MAX) + mp_sizeof_bool(ballot->is_ro_cfg) +
 		mp_sizeof_uint(UINT32_MAX) + mp_sizeof_bool(ballot->is_ro) +
-		mp_sizeof_uint(UINT32_MAX) + mp_sizeof_bool(ballot->is_loading) +
 		mp_sizeof_uint(IPROTO_BALLOT_IS_ANON) +
 		mp_sizeof_bool(ballot->is_anon) +
+		mp_sizeof_uint(IPROTO_BALLOT_IS_BOOTED) +
+		mp_sizeof_bool(ballot->is_booted) +
 		mp_sizeof_uint(UINT32_MAX) +
 		mp_sizeof_vclock_ignore0(&ballot->vclock) +
 		mp_sizeof_uint(UINT32_MAX) +
@@ -466,13 +472,15 @@ iproto_reply_vote(struct obuf *out, const struct ballot *ballot,
 	char *data = buf + IPROTO_HEADER_LEN;
 	data = mp_encode_map(data, 1);
 	data = mp_encode_uint(data, IPROTO_BALLOT);
-	data = mp_encode_map(data, 5);
+	data = mp_encode_map(data, 6);
+	data = mp_encode_uint(data, IPROTO_BALLOT_IS_RO_CFG);
+	data = mp_encode_bool(data, ballot->is_ro_cfg);
 	data = mp_encode_uint(data, IPROTO_BALLOT_IS_RO);
 	data = mp_encode_bool(data, ballot->is_ro);
-	data = mp_encode_uint(data, IPROTO_BALLOT_IS_LOADING);
-	data = mp_encode_bool(data, ballot->is_loading);
 	data = mp_encode_uint(data, IPROTO_BALLOT_IS_ANON);
 	data = mp_encode_bool(data, ballot->is_anon);
+	data = mp_encode_uint(data, IPROTO_BALLOT_IS_BOOTED);
+	data = mp_encode_bool(data, ballot->is_booted);
 	data = mp_encode_uint(data, IPROTO_BALLOT_VCLOCK);
 	data = mp_encode_vclock_ignore0(data, &ballot->vclock);
 	data = mp_encode_uint(data, IPROTO_BALLOT_GC_VCLOCK);
@@ -557,6 +565,8 @@ iproto_write_error(int fd, const struct error *e, uint32_t schema_version,
 			     schema_version, payload_size);
 
 	ssize_t unused;
+
+	ERROR_INJECT_YIELD(ERRINJ_IPROTO_WRITE_ERROR_DELAY);
 	unused = write(fd, header, sizeof(header));
 	unused = write(fd, payload, payload_size);
 	(void) unused;
@@ -882,28 +892,33 @@ xrow_encode_dml(const struct request *request, struct region *region,
 }
 
 void
-xrow_encode_synchro(struct xrow_header *row,
-		    struct synchro_body_bin *body,
+xrow_encode_synchro(struct xrow_header *row, char *body,
 		    const struct synchro_request *req)
 {
-	/*
-	 * A map with two elements. We don't compress
-	 * numbers to have this structure constant in size,
-	 * which allows us to preallocate it on stack.
-	 */
-	body->m_body = 0x80 | 2;
-	body->k_replica_id = IPROTO_REPLICA_ID;
-	body->m_replica_id = 0xce;
-	body->v_replica_id = mp_bswap_u32(req->replica_id);
-	body->k_lsn = IPROTO_LSN;
-	body->m_lsn = 0xcf;
-	body->v_lsn = mp_bswap_u64(req->lsn);
+	assert(iproto_type_is_synchro_request(req->type));
+
+	char *pos = body;
+
+	pos = mp_encode_map(pos,
+			    iproto_type_is_promote_request(req->type) ? 3 : 2);
+
+	pos = mp_encode_uint(pos, IPROTO_REPLICA_ID);
+	pos = mp_encode_uint(pos, req->replica_id);
+
+	pos = mp_encode_uint(pos, IPROTO_LSN);
+	pos = mp_encode_uint(pos, req->lsn);
+
+	if (iproto_type_is_promote_request(req->type)) {
+		pos = mp_encode_uint(pos, IPROTO_TERM);
+		pos = mp_encode_uint(pos, req->term);
+	}
+
+	assert(pos - body < XROW_SYNCHRO_BODY_LEN_MAX);
 
 	memset(row, 0, sizeof(*row));
-
 	row->type = req->type;
-	row->body[0].iov_base = (void *)body;
-	row->body[0].iov_len = sizeof(*body);
+	row->body[0].iov_base = body;
+	row->body[0].iov_len = pos - body;
 	row->bodycnt = 1;
 }
 
@@ -949,11 +964,17 @@ xrow_decode_synchro(const struct xrow_header *row, struct synchro_request *req)
 		case IPROTO_LSN:
 			req->lsn = mp_decode_uint(&d);
 			break;
+		case IPROTO_TERM:
+			req->term = mp_decode_uint(&d);
+			break;
 		default:
 			mp_next(&d);
 		}
 	}
+
 	req->type = row->type;
+	req->origin_id = row->replica_id;
+
 	return 0;
 }
 
@@ -1343,9 +1364,10 @@ xrow_encode_vote(struct xrow_header *row)
 int
 xrow_decode_ballot(struct xrow_header *row, struct ballot *ballot)
 {
+	ballot->is_ro_cfg = false;
 	ballot->is_ro = false;
-	ballot->is_loading = false;
 	ballot->is_anon = false;
+	ballot->is_booted = true;
 	vclock_create(&ballot->vclock);
 
 	const char *start = NULL;
@@ -1385,15 +1407,15 @@ xrow_decode_ballot(struct xrow_header *row, struct ballot *ballot)
 		}
 		uint32_t key = mp_decode_uint(&data);
 		switch (key) {
+		case IPROTO_BALLOT_IS_RO_CFG:
+			if (mp_typeof(*data) != MP_BOOL)
+				goto err;
+			ballot->is_ro_cfg = mp_decode_bool(&data);
+			break;
 		case IPROTO_BALLOT_IS_RO:
 			if (mp_typeof(*data) != MP_BOOL)
 				goto err;
 			ballot->is_ro = mp_decode_bool(&data);
-			break;
-		case IPROTO_BALLOT_IS_LOADING:
-			if (mp_typeof(*data) != MP_BOOL)
-				goto err;
-			ballot->is_loading = mp_decode_bool(&data);
 			break;
 		case IPROTO_BALLOT_IS_ANON:
 			if (mp_typeof(*data) != MP_BOOL)
@@ -1409,6 +1431,11 @@ xrow_decode_ballot(struct xrow_header *row, struct ballot *ballot)
 			if (mp_decode_vclock_ignore0(&data,
 						     &ballot->gc_vclock) != 0)
 				goto err;
+			break;
+		case IPROTO_BALLOT_IS_BOOTED:
+			if (mp_typeof(*data) != MP_BOOL)
+				goto err;
+			ballot->is_booted = mp_decode_bool(&data);
 			break;
 		default:
 			mp_next(&data);

@@ -92,7 +92,7 @@ enum raft_state {
  * Decode raft state into string representation.
  */
 const char *
-raft_state_str(uint32_t state);
+raft_state_str(uint64_t state);
 
 /**
  * Basic Raft communication unit for talking to other nodes, and even to other
@@ -110,7 +110,7 @@ struct raft_msg {
 	 * State of the instance. Can be 0 if the state does not matter for the
 	 * message. For instance, when the message is sent to disk.
 	 */
-	enum raft_state state;
+	uint64_t state;
 	/**
 	 * Vclock of the instance. Can be NULL, if the node is not a candidate.
 	 * Also is omitted when does not matter (when the message is for disk).
@@ -236,13 +236,6 @@ raft_is_ro(const struct raft *raft)
 	return raft->is_enabled && raft->state != RAFT_STATE_LEADER;
 }
 
-/** See if the instance can accept rows from an instance with the given ID. */
-static inline bool
-raft_is_source_allowed(const struct raft *raft, uint32_t source_id)
-{
-	return !raft->is_enabled || raft->leader == source_id;
-}
-
 /** Check if Raft is enabled. */
 static inline bool
 raft_is_enabled(const struct raft *raft)
@@ -280,6 +273,19 @@ raft_cfg_is_enabled(struct raft *raft, bool is_enabled);
  */
 void
 raft_cfg_is_candidate(struct raft *raft, bool is_candidate);
+
+/**
+ * Make the instance a candidate.
+ */
+void
+raft_start_candidate(struct raft *raft);
+
+/**
+ * Make the instance stop taking part in new elections.
+ * @param do_demote whether to stop being a leader immediately or not.
+ */
+void
+raft_stop_candidate(struct raft *raft, bool do_demote);
 
 /** Configure Raft leader election timeout. */
 void
